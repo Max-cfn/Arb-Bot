@@ -58,6 +58,7 @@ class PolymarketWebSocket:
         delay = INITIAL_RECONNECT_DELAY
 
         while self._running:
+            ws: websockets.WebSocketClientProtocol | None = None
             try:
                 async with websockets.connect(
                     WS_URL,
@@ -65,6 +66,7 @@ class PolymarketWebSocket:
                     ping_timeout=10,
                     close_timeout=5,
                 ) as ws:
+                    self._connections.append(ws)
                     self._consecutive_failures = 0
                     delay = INITIAL_RECONNECT_DELAY
                     logger.info("WebSocket connected, subscribing to %d assets", len(asset_ids))
@@ -73,7 +75,9 @@ class PolymarketWebSocket:
                     subscribe_msg = json.dumps({
                         "type": "subscribe",
                         "channel": "market",
+                        # Polymarket payloads have used both spellings in the wild.
                         "assets_ids": asset_ids,
+                        "asset_ids": asset_ids,
                     })
                     await ws.send(subscribe_msg)
 
@@ -95,9 +99,18 @@ class PolymarketWebSocket:
                     )
                     if self.on_error:
                         await self.on_error(
-                            ConnectionError(f"Max reconnect attempts ({MAX_RECONNECT_ATTEMPTS}) exceeded")
+                            ConnectionError(
+                                f"Max reconnect attempts ({MAX_RECONNECT_ATTEMPTS}) exceeded"
+                            )
                         )
                     return
+            finally:
+                # Best-effort cleanup of the connection handle
+                try:
+                    if ws is not None and ws in self._connections:
+                        self._connections.remove(ws)
+                except Exception:
+                    pass
 
             if self._running:
                 logger.info("Reconnecting in %.1fs...", delay)
@@ -111,6 +124,16 @@ class PolymarketWebSocket:
         except json.JSONDecodeError:
             return
 
+        # Polymarket sometimes batches messages (e.g. a JSON list of events)
+        if isinstance(msg, list):
+            for item in msg:
+                if isinstance(item, dict):
+                    await self._handle_message(json.dumps(item))
+            return
+
+        if not isinstance(msg, dict):
+            return
+
         msg_type = msg.get("type")
 
         if msg_type == "book":
@@ -119,10 +142,12 @@ class PolymarketWebSocket:
                 "bids": [
                     (float(o["price"]), float(o["size"]))
                     for o in msg.get("bids", [])
+                    if isinstance(o, dict) and "price" in o and "size" in o
                 ],
                 "asks": [
                     (float(o["price"]), float(o["size"]))
                     for o in msg.get("asks", [])
+                    if isinstance(o, dict) and "price" in o and "size" in o
                 ],
             }
             await self.on_orderbook_update(asset_id, orderbook)
