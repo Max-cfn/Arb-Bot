@@ -92,7 +92,30 @@ class PolymarketWebSocket:
                             self._debug_raw_remaining -= 1
                             # Trim payload to avoid massive OPS spam
                             preview = raw if len(raw) <= 1200 else raw[:1200] + "…"
-                            await self.on_debug(f"WS raw message (preview):\n{preview}")
+
+                            # Try to parse and summarize structure
+                            summary_lines = []
+                            try:
+                                parsed = json.loads(raw)
+                                if isinstance(parsed, list):
+                                    summary_lines.append(f"kind=list len={len(parsed)}")
+                                    first = parsed[0] if parsed else None
+                                    if isinstance(first, dict):
+                                        summary_lines.append(
+                                            f"first.type={first.get('type')} keys={list(first.keys())[:20]}"
+                                        )
+                                    else:
+                                        summary_lines.append(f"first.kind={type(first).__name__}")
+                                elif isinstance(parsed, dict):
+                                    summary_lines.append(f"kind=dict type={parsed.get('type')} keys={list(parsed.keys())[:30]}")
+                                else:
+                                    summary_lines.append(f"kind={type(parsed).__name__}")
+                            except Exception as exc:
+                                summary_lines.append(f"parse_error={exc}")
+
+                            summary = " | ".join(summary_lines)
+                            await self.on_debug(f"WS raw message (summary): {summary}\nWS raw message (preview):\n{preview}")
+
                         await self._handle_message(raw)
 
             except websockets.ConnectionClosed as exc:
