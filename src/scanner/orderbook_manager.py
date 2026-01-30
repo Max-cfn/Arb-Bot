@@ -18,7 +18,11 @@ class Orderbook:
 
 
 class OrderbookManager:
-    """Holds current orderbook state for all tracked assets."""
+    """Holds current orderbook state for all tracked assets.
+
+    Note: we keep per-asset last_update timestamps so we can debug whether the
+    WebSocket stream is actually delivering book updates.
+    """
 
     def __init__(self, markets: list[dict] | None = None):
         # asset_id -> Orderbook
@@ -84,12 +88,26 @@ class OrderbookManager:
     def get_stats(self) -> dict:
         """Return summary statistics."""
         now = time.time()
-        stale_count = sum(
-            1 for b in self._books.values()
-            if now - b.last_update > 60
-        )
+        stale_count = sum(1 for b in self._books.values() if now - b.last_update > 60)
+        newest_update = max((b.last_update for b in self._books.values()), default=0.0)
+        oldest_update = min((b.last_update for b in self._books.values()), default=0.0)
         return {
             "tracked_assets": self.tracked_assets,
             "total_markets": self.total_markets,
             "stale_books": stale_count,
+            "newest_update": newest_update,
+            "oldest_update": oldest_update,
         }
+
+    def get_recent_assets(self, n: int = 10) -> list[tuple[str, float, float | None, float | None]]:
+        """Return the N most recently updated assets.
+
+        Each item is (asset_id, last_update_epoch, best_bid, best_ask).
+        """
+        items = sorted(self._books.items(), key=lambda kv: kv[1].last_update, reverse=True)[:n]
+        out: list[tuple[str, float, float | None, float | None]] = []
+        for asset_id, book in items:
+            best_bid = book.bids[0][0] if book.bids else None
+            best_ask = book.asks[0][0] if book.asks else None
+            out.append((asset_id, book.last_update, best_bid, best_ask))
+        return out

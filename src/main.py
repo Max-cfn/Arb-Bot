@@ -24,6 +24,9 @@ MARKET_REFRESH_INTERVAL = 900  # 15 min
 DAILY_SUMMARY_HOUR = 8       # 08:00 UTC
 DB_PURGE_INTERVAL = 3600     # 1 hour
 
+# Debug: send periodic WS/OB stats to OPS to validate stream end-to-end
+DEBUG_OPS_INTERVAL = 60      # 1 min
+
 
 async def periodic_health_check(
     discord: DiscordClient,
@@ -104,6 +107,52 @@ async def periodic_db_purge(db: Database) -> None:
             logger.error("DB purge failed: %s", exc)
 
 
+async def periodic_ops_debug(
+    discord: DiscordClient,
+    ob_manager: OrderbookManager,
+    start_time: float,
+) -> None:
+    """Send periodic debug stats to OPS (low frequency).
+
+    Useful to validate whether WebSocket book updates are actually flowing.
+    """
+    # Small delay to let the bot connect first
+    await asyncio.sleep(10)
+
+    while True:
+        await asyncio.sleep(DEBUG_OPS_INTERVAL)
+        try:
+            stats = ob_manager.get_stats()
+            recent = ob_manager.get_recent_assets(10)
+
+            now = time.time()
+            uptime_s = int(now - start_time)
+            h, rem = divmod(uptime_s, 3600)
+            m, s = divmod(rem, 60)
+
+            newest_age = int(now - stats.get("newest_update", 0.0)) if stats.get("newest_update") else None
+
+            lines = []
+            lines.append(f"WS/OB debug | uptime={h:02d}h{m:02d}m{s:02d}s")
+            lines.append(
+                f"tracked_assets={stats.get('tracked_assets')} total_markets={stats.get('total_markets')} stale_books={stats.get('stale_books')}"
+            )
+            if newest_age is not None:
+                lines.append(f"newest_book_age={newest_age}s")
+            if not recent:
+                lines.append("recent_assets: (none yet)")
+            else:
+                lines.append("recent_assets (asset_id | age_s | best_bid | best_ask):")
+                for asset_id, last_upd, best_bid, best_ask in recent:
+                    age = int(now - last_upd)
+                    lines.append(f"- {asset_id} | {age}s | {best_bid} | {best_ask}")
+
+            msg = "\n".join(lines)
+            await discord.send_ops(msg)
+        except Exception as exc:
+            logger.error("OPS debug failed: %s", exc)
+
+
 async def main() -> None:
     """Main bot loop."""
     start_time = time.time()
@@ -158,9 +207,36 @@ async def main() -> None:
     })
 
     # --- Orderbook update callback ---
+    last_ops_sample: float = 0.0
+
     async def on_orderbook_update(asset_id: str, book: dict) -> None:
+        nonlocal last_ops_sample
         ob_manager.update(asset_id, book)
         affected = ob_manager.get_markets_by_asset(asset_id)
+
+        # Low-rate debug sample to OPS so you can visually confirm streaming orderbooks.
+        # Sends at most once per minute.
+        now = time.time()
+        if now - last_ops_sample > 60:
+            last_ops_sample = now
+            try:
+                market = affected[0] if affected else None
+                book_obj = ob_manager.get_book(asset_id)
+                best_bid = book_obj.bids[0] if book_obj and book_obj.bids else None
+                best_ask = book_obj.asks[0] if book_obj and book_obj.asks else None
+
+                msg = (
+                    "WS sample update\n"
+                    f"asset_id={asset_id}\n"
+                    f"market_id={market.get('id') if market else ''}\n"
+                    f"question={market.get('question') if market else ''}\n"
+                    f"best_bid={best_bid}\n"
+                    f"best_ask={best_ask}"
+                )
+                await discord.send_ops(msg)
+            except Exception as exc:
+                logger.error("Failed to send WS sample to OPS: %s", exc)
+
         for market in affected:
             opp = detector.detect(market, ob_manager)
             if opp:
@@ -201,6 +277,10 @@ async def main() -> None:
         asyncio.create_task(
             periodic_health_check(discord, ob_manager, start_time),
             name="health",
+        ),
+        asyncio.create_task(
+            periodic_ops_debug(discord, ob_manager, start_time),
+            name="ops_debug",
         ),
         asyncio.create_task(
             periodic_market_refresh(ob_manager, ws_client, config.max_markets_watch),
