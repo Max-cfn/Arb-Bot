@@ -147,6 +147,29 @@ async def periodic_ops_debug(
                     age = int(now - last_upd)
                     lines.append(f"- {asset_id} | {age}s | {best_bid} | {best_ask}")
 
+                # Also try to compute a few "raw" (best-ask-based) edges at market level
+                # even if they don't pass thresholds.
+                lines.append("raw_edges (market_id | combined_best_asks | gross_edge | question):")
+                seen = 0
+                for asset_id, _, _, _ in recent:
+                    mkts = ob_manager.get_markets_by_asset(asset_id)
+                    if not mkts:
+                        continue
+                    mkt = mkts[0]
+                    yes_book, no_book = ob_manager.get_market_books(mkt)
+                    yes_ask = yes_book.asks[0][0] if yes_book and yes_book.asks else None
+                    no_ask = no_book.asks[0][0] if no_book and no_book.asks else None
+                    if yes_ask is None or no_ask is None:
+                        continue
+                    combined = yes_ask + no_ask
+                    gross_edge = 1.0 - combined
+                    lines.append(
+                        f"- {mkt.get('id')} | {combined:.4f} | {gross_edge:.4f} | {mkt.get('question','')[:90]}"
+                    )
+                    seen += 1
+                    if seen >= 5:
+                        break
+
             msg = "\n".join(lines)
             await discord.send_ops(msg)
         except Exception as exc:
@@ -225,6 +248,18 @@ async def main() -> None:
                 best_bid = book_obj.bids[0] if book_obj and book_obj.bids else None
                 best_ask = book_obj.asks[0] if book_obj and book_obj.asks else None
 
+                extra = ""
+                if market and market.get("tokens") and len(market.get("tokens", [])) >= 2:
+                    try:
+                        yes_book, no_book = ob_manager.get_market_books(market)
+                        yes_ask = yes_book.asks[0][0] if yes_book and yes_book.asks else None
+                        no_ask = no_book.asks[0][0] if no_book and no_book.asks else None
+                        if yes_ask is not None and no_ask is not None:
+                            combined = yes_ask + no_ask
+                            extra = f"\ncombined_best_asks={combined:.4f} gross_edge={(1.0-combined):.4f}"
+                    except Exception:
+                        pass
+
                 msg = (
                     "WS sample update\n"
                     f"asset_id={asset_id}\n"
@@ -232,6 +267,7 @@ async def main() -> None:
                     f"question={market.get('question') if market else ''}\n"
                     f"best_bid={best_bid}\n"
                     f"best_ask={best_ask}"
+                    f"{extra}"
                 )
                 await discord.send_ops(msg)
             except Exception as exc:

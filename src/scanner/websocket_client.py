@@ -153,16 +153,25 @@ class PolymarketWebSocket:
             await self.on_orderbook_update(asset_id, orderbook)
 
     async def update_subscriptions(self, new_asset_ids: list[str]) -> None:
-        """Update the asset list (requires reconnect)."""
+        """Update the asset list (forces a reconnect).
+
+        Important: we must NOT stop the main connect loop when refreshing markets,
+        otherwise the websocket task ends and the whole bot may shut down.
+        """
         self.asset_ids = new_asset_ids
         logger.info("Subscription list updated (%d assets). Reconnecting...", len(new_asset_ids))
-        await self.close()
-        # The connect loop will restart in main
+        await self.close(stop=False)
 
-    async def close(self) -> None:
-        """Gracefully close all connections."""
-        self._running = False
-        for ws in self._connections:
+    async def close(self, stop: bool = True) -> None:
+        """Gracefully close all connections.
+
+        Args:
+            stop: if True, stop the reconnect loop; if False, only close current
+                  sockets so the loop can reconnect with updated subscriptions.
+        """
+        if stop:
+            self._running = False
+        for ws in list(self._connections):
             try:
                 await ws.close()
             except Exception:
