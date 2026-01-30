@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import signal
 import sys
 import time
@@ -18,6 +19,8 @@ from src.storage.db import Database
 from src.utils.geoblock import check_geoblock, get_public_ip
 from src.utils.logger import logger
 
+import websockets
+
 # Intervals (seconds)
 HEALTH_INTERVAL = 300        # 5 min
 MARKET_REFRESH_INTERVAL = 900  # 15 min
@@ -26,6 +29,9 @@ DB_PURGE_INTERVAL = 3600     # 1 hour
 
 # Debug: send periodic WS/OB stats to OPS to validate stream end-to-end
 DEBUG_OPS_INTERVAL = 60      # 1 min
+WS_PROBE_ON_START = True
+WS_PROBE_TIMEOUT_S = 6.0
+WS_PROBE_MAX_MSGS = 4
 
 
 async def periodic_health_check(
@@ -105,6 +111,73 @@ async def periodic_db_purge(db: Database) -> None:
             await db.purge_old(hours=24)
         except Exception as exc:
             logger.error("DB purge failed: %s", exc)
+
+
+async def ws_probe_subscriptions(discord: DiscordClient, asset_ids: list[str]) -> None:
+    """Try several subscribe payload variants and report what the WS returns.
+
+    This is intentionally noisy but bounded (few messages, one-shot) and is meant
+    to help us discover correct channel/field names.
+    """
+    if not asset_ids:
+        return
+
+    # Keep the probe small
+    probe_assets = asset_ids[:10]
+
+    variants: list[dict] = [
+        {"type": "subscribe", "channel": "market", "assets_ids": probe_assets},
+        {"type": "subscribe", "channel": "market", "asset_ids": probe_assets},
+        {"type": "subscribe", "channel": "market", "assets_ids": probe_assets, "asset_ids": probe_assets},
+        {"type": "subscribe", "channel": "book", "asset_ids": probe_assets},
+        {"type": "subscribe", "channel": "orderbook", "asset_ids": probe_assets},
+    ]
+
+    async def _summarize(raw: str) -> str:
+        try:
+            parsed = json.loads(raw)
+        except Exception as exc:
+            return f"parse_error={exc} raw={raw[:200]}"
+
+        if isinstance(parsed, list):
+            first = parsed[0] if parsed else None
+            if isinstance(first, dict):
+                return f"kind=list len={len(parsed)} first.type={first.get('type')} first.keys={list(first.keys())[:15]}"
+            return f"kind=list len={len(parsed)} first.kind={type(first).__name__}"
+
+        if isinstance(parsed, dict):
+            return f"kind=dict type={parsed.get('type')} keys={list(parsed.keys())[:20]}"
+
+        return f"kind={type(parsed).__name__}"
+
+    # Run sequentially to avoid interleaving outputs.
+    for i, payload in enumerate(variants, 1):
+        lines = [f"WS probe {i}/{len(variants)} payload={payload}"]
+        try:
+            async with websockets.connect(
+                "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+                ping_interval=30,
+                ping_timeout=10,
+                close_timeout=5,
+            ) as ws:
+                await ws.send(json.dumps(payload))
+
+                got = 0
+                start = time.time()
+                while got < WS_PROBE_MAX_MSGS and (time.time() - start) < WS_PROBE_TIMEOUT_S:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        lines.append("- timeout")
+                        continue
+                    got += 1
+                    lines.append(f"- msg{got}: {await _summarize(raw)}")
+
+        except Exception as exc:
+            lines.append(f"- exception: {exc}")
+
+        await discord.send_ops("\n".join(lines))
+        await asyncio.sleep(1)
 
 
 async def periodic_ops_debug(
@@ -288,6 +361,11 @@ async def main() -> None:
 
     # --- WebSocket client ---
     asset_ids = extract_all_token_ids(markets)
+
+    if WS_PROBE_ON_START:
+        # Fire-and-forget probe (bounded). Helps us discover correct subscribe format.
+        asyncio.create_task(ws_probe_subscriptions(discord, asset_ids), name="ws_probe")
+
     ws_client = PolymarketWebSocket(
         asset_ids=asset_ids,
         on_orderbook_update=on_orderbook_update,
