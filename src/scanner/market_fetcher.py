@@ -63,7 +63,7 @@ def _parse_market(raw: dict) -> dict | None:
         outcome_prices = raw.get("outcomePrices", "")
 
         if isinstance(clob_ids, str):
-            clob_ids = [t.strip() for t in clob_ids.strip("[]").split(",") if t.strip()]
+            clob_ids = [t.strip().strip('"') for t in clob_ids.strip("[]").split(",") if t.strip()]
         if isinstance(outcomes_str, str):
             outcomes_str = [o.strip().strip('"') for o in outcomes_str.strip("[]").split(",") if o.strip()]
         if isinstance(outcome_prices, str):

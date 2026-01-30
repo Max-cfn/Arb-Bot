@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import signal
 import sys
 import time
@@ -18,11 +20,19 @@ from src.storage.db import Database
 from src.utils.geoblock import check_geoblock, get_public_ip
 from src.utils.logger import logger
 
+import websockets
+
 # Intervals (seconds)
 HEALTH_INTERVAL = 300        # 5 min
 MARKET_REFRESH_INTERVAL = 900  # 15 min
 DAILY_SUMMARY_HOUR = 8       # 08:00 UTC
 DB_PURGE_INTERVAL = 3600     # 1 hour
+
+# Debug: send periodic WS/OB stats to OPS to validate stream end-to-end
+DEBUG_OPS_INTERVAL = 60      # 1 min
+WS_PROBE_ON_START = True
+WS_PROBE_TIMEOUT_S = 6.0
+WS_PROBE_MAX_MSGS = 4
 
 
 async def periodic_health_check(
@@ -48,21 +58,48 @@ async def periodic_health_check(
             logger.error("Health check failed: %s", exc)
 
 
+def select_markets(
+    markets: list[dict],
+    max_markets: int,
+    min_liquidity_usd: float,
+    min_volume_usd: float,
+) -> list[dict]:
+    """Select a market universe.
+
+    Aggressive OR filter: keep markets with liquidity>=min_liquidity_usd OR volume>=min_volume_usd.
+    Then sort by (liquidity + volume) descending and take top max_markets.
+    """
+    filtered = [
+        m for m in markets
+        if (float(m.get("liquidity", 0) or 0) >= min_liquidity_usd)
+        or (float(m.get("volume", 0) or 0) >= min_volume_usd)
+    ]
+    filtered.sort(
+        key=lambda m: float(m.get("liquidity", 0) or 0) + float(m.get("volume", 0) or 0),
+        reverse=True,
+    )
+    return filtered[:max_markets]
+
+
 async def periodic_market_refresh(
     ob_manager: OrderbookManager,
     ws_client: PolymarketWebSocket,
     max_markets: int,
+    min_liquidity_usd: float,
+    min_volume_usd: float,
 ) -> None:
     """Refresh the active market list periodically."""
     while True:
         await asyncio.sleep(MARKET_REFRESH_INTERVAL)
         try:
-            new_markets = await fetch_active_markets(max_markets)
+            # Fetch a larger pool, then filter/sort down to our watchlist.
+            pool = await fetch_active_markets(50000)
+            new_markets = select_markets(pool, max_markets, min_liquidity_usd, min_volume_usd)
             if new_markets:
                 ob_manager.load_markets(new_markets)
                 new_ids = extract_all_token_ids(new_markets)
                 await ws_client.update_subscriptions(new_ids)
-                logger.info("Refreshed markets: %d active", len(new_markets))
+                logger.info("Refreshed markets: %d active (filtered from %d)", len(new_markets), len(pool))
         except Exception as exc:
             logger.error("Market refresh failed: %s", exc)
 
@@ -104,6 +141,142 @@ async def periodic_db_purge(db: Database) -> None:
             logger.error("DB purge failed: %s", exc)
 
 
+async def ws_probe_subscriptions(discord: DiscordClient, asset_ids: list[str]) -> None:
+    """Try several subscribe payload variants and report what the WS returns.
+
+    This is intentionally noisy but bounded (few messages, one-shot) and is meant
+    to help us discover correct channel/field names.
+    """
+    if not asset_ids:
+        return
+
+    # Keep the probe small
+    probe_assets = asset_ids[:10]
+
+    variants: list[dict] = [
+        # Per docs: initial sub uses type=MARKET + assets_ids
+        {"type": "MARKET", "assets_ids": probe_assets},
+        {"type": "MARKET", "assets_ids": probe_assets, "custom_feature_enabled": True},
+        # Some WS implementations also accept operation-based subscribe
+        {"type": "MARKET", "operation": "subscribe", "assets_ids": probe_assets},
+    ]
+
+    async def _summarize(raw: str) -> str:
+        try:
+            parsed = json.loads(raw)
+        except Exception as exc:
+            return f"parse_error={exc} raw={raw[:200]}"
+
+        if isinstance(parsed, list):
+            first = parsed[0] if parsed else None
+            if isinstance(first, dict):
+                return f"kind=list len={len(parsed)} first.type={first.get('type')} first.keys={list(first.keys())[:15]}"
+            return f"kind=list len={len(parsed)} first.kind={type(first).__name__}"
+
+        if isinstance(parsed, dict):
+            return f"kind=dict type={parsed.get('type')} keys={list(parsed.keys())[:20]}"
+
+        return f"kind={type(parsed).__name__}"
+
+    # Run sequentially to avoid interleaving outputs.
+    for i, payload in enumerate(variants, 1):
+        lines = [f"WS probe {i}/{len(variants)} payload={payload}"]
+        try:
+            async with websockets.connect(
+                "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+                ping_interval=30,
+                ping_timeout=10,
+                close_timeout=5,
+            ) as ws:
+                await ws.send(json.dumps(payload))
+
+                got = 0
+                start = time.time()
+                while got < WS_PROBE_MAX_MSGS and (time.time() - start) < WS_PROBE_TIMEOUT_S:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        lines.append("- timeout")
+                        continue
+                    got += 1
+                    lines.append(f"- msg{got}: {await _summarize(raw)}")
+
+        except Exception as exc:
+            lines.append(f"- exception: {exc}")
+
+        await discord.send_ops("\n".join(lines))
+        await asyncio.sleep(1)
+
+
+async def periodic_ops_debug(
+    discord: DiscordClient,
+    ob_manager: OrderbookManager,
+    start_time: float,
+) -> None:
+    """Send periodic debug stats to OPS (low frequency).
+
+    Useful to validate whether WebSocket book updates are actually flowing.
+    """
+    # Small delay to let the bot connect first
+    await asyncio.sleep(10)
+
+    while True:
+        await asyncio.sleep(DEBUG_OPS_INTERVAL)
+        try:
+            stats = ob_manager.get_stats()
+            recent = ob_manager.get_recent_assets(10)
+
+            now = time.time()
+            uptime_s = int(now - start_time)
+            h, rem = divmod(uptime_s, 3600)
+            m, s = divmod(rem, 60)
+
+            newest_age = int(now - stats.get("newest_update", 0.0)) if stats.get("newest_update") else None
+
+            lines = []
+            lines.append(f"WS/OB debug | uptime={h:02d}h{m:02d}m{s:02d}s")
+            lines.append(
+                f"tracked_assets={stats.get('tracked_assets')} total_markets={stats.get('total_markets')} stale_books={stats.get('stale_books')}"
+            )
+            if newest_age is not None:
+                lines.append(f"newest_book_age={newest_age}s")
+            if not recent:
+                lines.append("recent_assets: (none yet)")
+            else:
+                lines.append("recent_assets (asset_id | age_s | best_bid | best_ask):")
+                for asset_id, last_upd, best_bid, best_ask in recent:
+                    age = int(now - last_upd)
+                    lines.append(f"- {asset_id} | {age}s | {best_bid} | {best_ask}")
+
+                # Also try to compute a few "raw" (best-ask-based) edges at market level
+                # even if they don't pass thresholds.
+                lines.append("raw_edges (market_id | combined_best_asks | gross_edge | question):")
+                seen = 0
+                for asset_id, _, _, _ in recent:
+                    mkts = ob_manager.get_markets_by_asset(asset_id)
+                    if not mkts:
+                        continue
+                    mkt = mkts[0]
+                    yes_book, no_book = ob_manager.get_market_books(mkt)
+                    yes_ask = yes_book.asks[0][0] if yes_book and yes_book.asks else None
+                    no_ask = no_book.asks[0][0] if no_book and no_book.asks else None
+                    if yes_ask is None or no_ask is None:
+                        continue
+                    combined = yes_ask + no_ask
+                    gross_edge = 1.0 - combined
+                    lines.append(
+                        f"- {mkt.get('id')} | {combined:.4f} | {gross_edge:.4f} | {mkt.get('question','')[:90]}"
+                    )
+                    seen += 1
+                    if seen >= 5:
+                        break
+
+            msg = "\n".join(lines)
+            await discord.send_ops(msg)
+        except Exception as exc:
+            logger.error("OPS debug failed: %s", exc)
+
+
 async def main() -> None:
     """Main bot loop."""
     start_time = time.time()
@@ -117,6 +290,36 @@ async def main() -> None:
         sys.exit(1)
 
     discord = DiscordClient(config)
+
+    # One-time debug: send a fake opportunity message to validate the Discord webhook.
+    # Controlled by env var so we don't spam.
+    if ("" + str(os.getenv("SEND_FAKE_OPP_ONCE", ""))).strip() == "1":
+        try:
+            from src.detector.base import ArbitrageOpportunity
+            fake = ArbitrageOpportunity(
+                market_id="DEBUG",
+                market_question="DEBUG: webhook test opportunity (ignore)",
+                yes_token_id="DEBUG_YES",
+                no_token_id="DEBUG_NO",
+                yes_ask_vwap=0.49,
+                no_ask_vwap=0.49,
+                combined_cost=0.98,
+                gross_edge=0.02,
+                gross_edge_percent=2.04,
+                net_edge=0.02,
+                net_edge_percent=2.04,
+                size_usd=100.0,
+                yes_liquidity=1000.0,
+                no_liquidity=1000.0,
+                max_safe_size=500.0,
+                timestamp=datetime.now(timezone.utc),
+                is_crypto_15min=False,
+                verdict="ACTIONABLE",
+            )
+            await discord.send_opportunity(fake)
+            await discord.send_ops("DEBUG: sent one fake opportunity (SEND_FAKE_OPP_ONCE=1)")
+        except Exception as exc:
+            logger.error("Failed to send fake opportunity: %s", exc)
 
     # --- Geoblock check ---
     logger.info("Checking geoblock status...")
@@ -136,17 +339,29 @@ async def main() -> None:
 
     # --- Fetch markets ---
     logger.info("Fetching active markets...")
-    markets = await fetch_active_markets(config.max_markets_watch)
+    # Fetch a large pool then select a watchlist (more stable than taking the first N).
+    pool = await fetch_active_markets(50000)
+    markets = select_markets(
+        pool,
+        config.max_markets_watch,
+        config.market_min_liquidity_usd,
+        config.market_min_volume_usd,
+    )
     if not markets:
-        logger.error("No markets found. Exiting.")
-        await discord.send_ops("CRITICAL: No active markets found, bot cannot start")
+        logger.error("No markets found after filtering. Exiting.")
+        await discord.send_ops("CRITICAL: No markets found after filtering, bot cannot start")
         sys.exit(1)
 
-    logger.info("Loaded %d markets", len(markets))
+    logger.info(
+        "Loaded %d markets (filtered from %d)",
+        len(markets),
+        len(pool),
+    )
 
     # --- Setup components ---
     ob_manager = OrderbookManager(markets)
     detector = BinaryArbDetector(config)
+    target_size_usd = config.target_size_usd
 
     # Startup health message
     ip = geo["ip"]
@@ -158,11 +373,51 @@ async def main() -> None:
     })
 
     # --- Orderbook update callback ---
+    last_ops_sample: float = 0.0
+
     async def on_orderbook_update(asset_id: str, book: dict) -> None:
+        nonlocal last_ops_sample
         ob_manager.update(asset_id, book)
         affected = ob_manager.get_markets_by_asset(asset_id)
+
+        # Low-rate debug sample to OPS so you can visually confirm streaming orderbooks.
+        # Sends at most once per minute.
+        now = time.time()
+        if now - last_ops_sample > 60:
+            last_ops_sample = now
+            try:
+                market = affected[0] if affected else None
+                book_obj = ob_manager.get_book(asset_id)
+                best_bid = book_obj.bids[0] if book_obj and book_obj.bids else None
+                best_ask = book_obj.asks[0] if book_obj and book_obj.asks else None
+
+                extra = ""
+                if market and market.get("tokens") and len(market.get("tokens", [])) >= 2:
+                    try:
+                        yes_book, no_book = ob_manager.get_market_books(market)
+                        yes_ask = yes_book.asks[0][0] if yes_book and yes_book.asks else None
+                        no_ask = no_book.asks[0][0] if no_book and no_book.asks else None
+                        if yes_ask is not None and no_ask is not None:
+                            combined = yes_ask + no_ask
+                            extra = f"\ncombined_best_asks={combined:.4f} gross_edge={(1.0-combined):.4f}"
+                    except Exception:
+                        pass
+
+                msg = (
+                    "WS sample update\n"
+                    f"asset_id={asset_id}\n"
+                    f"market_id={market.get('id') if market else ''}\n"
+                    f"question={market.get('question') if market else ''}\n"
+                    f"best_bid={best_bid}\n"
+                    f"best_ask={best_ask}"
+                    f"{extra}"
+                )
+                await discord.send_ops(msg)
+            except Exception as exc:
+                logger.error("Failed to send WS sample to OPS: %s", exc)
+
         for market in affected:
-            opp = detector.detect(market, ob_manager)
+            opp = detector.detect(market, ob_manager, target_size_usd=target_size_usd)
             if opp:
                 await discord.send_opportunity(opp)
                 await db.log_opportunity(opp)
@@ -170,12 +425,23 @@ async def main() -> None:
     async def on_ws_error(exc: Exception) -> None:
         await discord.send_ops(f"WebSocket error: {exc}")
 
+    async def on_ws_debug(msg: str) -> None:
+        # Keep debug visible in the OPS channel
+        await discord.send_ops(msg)
+
     # --- WebSocket client ---
     asset_ids = extract_all_token_ids(markets)
+
+    if WS_PROBE_ON_START:
+        # Fire-and-forget probe (bounded). Helps us discover correct subscribe format.
+        asyncio.create_task(ws_probe_subscriptions(discord, asset_ids), name="ws_probe")
+
     ws_client = PolymarketWebSocket(
         asset_ids=asset_ids,
         on_orderbook_update=on_orderbook_update,
         on_error=on_ws_error,
+        on_debug=on_ws_debug,
+        debug_raw_messages=3,
     )
 
     # --- Graceful shutdown ---
@@ -198,12 +464,19 @@ async def main() -> None:
 
     tasks = [
         asyncio.create_task(ws_client.connect(), name="websocket"),
+        # health task disabled (was sending HEALTH webhook every 5 min)
         asyncio.create_task(
-            periodic_health_check(discord, ob_manager, start_time),
-            name="health",
+            periodic_ops_debug(discord, ob_manager, start_time),
+            name="ops_debug",
         ),
         asyncio.create_task(
-            periodic_market_refresh(ob_manager, ws_client, config.max_markets_watch),
+            periodic_market_refresh(
+                ob_manager,
+                ws_client,
+                config.max_markets_watch,
+                config.market_min_liquidity_usd,
+                config.market_min_volume_usd,
+            ),
             name="market_refresh",
         ),
         asyncio.create_task(

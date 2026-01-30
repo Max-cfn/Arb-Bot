@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from src.detector.base import ArbitrageOpportunity
 
@@ -14,6 +15,26 @@ EMBED_COLORS = {
     "info": 0x0099FF,
     "opportunity": 0xFFD700,
 }
+
+PARIS_TZ = ZoneInfo("Europe/Paris")
+
+
+def _format_resolve_time_paris(end_date: str) -> str:
+    """Format an ISO end_date (usually UTC/Z) into Europe/Paris time."""
+    if not end_date:
+        return "(unknown)"
+
+    try:
+        # Gamma uses e.g. 2026-01-30T16:00:00Z
+        dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        paris = dt.astimezone(PARIS_TZ)
+        # Example: 2026-01-30 17:00 (Europe/Paris)
+        return paris.strftime("%Y-%m-%d %H:%M") + " (Paris)"
+    except Exception:
+        # Fallback to raw string
+        return end_date
 
 
 def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
@@ -33,6 +54,9 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
         "embeds": [
             {
                 "title": opp.market_question[:256],
+                "url": (
+                    f"https://polymarket.com/market/{opp.slug}" if getattr(opp, "slug", "") else None
+                ),
                 "color": color,
                 "fields": [
                     {
@@ -71,6 +95,20 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
                     {
                         "name": "Type",
                         "value": "Crypto 15min" if opp.is_crypto_15min else "Standard",
+                        "inline": True,
+                    },
+                    {
+                        "name": "Market",
+                        "value": (
+                            f"https://polymarket.com/market/{opp.slug}"
+                            if getattr(opp, "slug", "")
+                            else "(no slug)"
+                        ),
+                        "inline": False,
+                    },
+                    {
+                        "name": "Resolves",
+                        "value": _format_resolve_time_paris(getattr(opp, "end_date", "")),
                         "inline": True,
                     },
                     {

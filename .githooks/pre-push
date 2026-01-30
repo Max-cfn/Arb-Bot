@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Block pushes to origin/main or origin/master
+remote_name="${1:-}"
+remote_url="${2:-}"
+
+# Read refs from stdin: <local ref> <local sha> <remote ref> <remote sha>
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$remote_ref" in
+    refs/heads/main|refs/heads/master)
+      if [[ "${ALLOW_MAIN_PUSH:-}" == "1" ]]; then
+        exit 0
+      fi
+
+      cat >&2 <<EOF
+❌ Direct push to ${remote_name:-remote}:${remote_ref#refs/heads/} is blocked.
+
+Push a branch and open a PR instead:
+  git push -u origin <your-branch>
+
+Emergency bypass (one-time):
+  ALLOW_MAIN_PUSH=1 git push ...
+
+Remote: ${remote_url}
+EOF
+      exit 1
+      ;;
+  esac
+done
+
+exit 0

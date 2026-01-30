@@ -25,13 +25,18 @@ class PolymarketWebSocket:
         asset_ids: list[str],
         on_orderbook_update: Callable[[str, dict], Awaitable[None]],
         on_error: Callable[[Exception], Awaitable[None]] | None = None,
+        on_debug: Callable[[str], Awaitable[None]] | None = None,
+        debug_raw_messages: int = 3,
     ):
         self.asset_ids = asset_ids
         self.on_orderbook_update = on_orderbook_update
         self.on_error = on_error
+        self.on_debug = on_debug
+        self.debug_raw_messages = debug_raw_messages
         self._connections: list[websockets.WebSocketClientProtocol] = []
         self._running = False
         self._consecutive_failures = 0
+        self._debug_raw_remaining = debug_raw_messages
 
     async def connect(self) -> None:
         """Start WebSocket connections (splits assets across connections if needed)."""
@@ -58,6 +63,7 @@ class PolymarketWebSocket:
         delay = INITIAL_RECONNECT_DELAY
 
         while self._running:
+            ws: websockets.WebSocketClientProtocol | None = None
             try:
                 async with websockets.connect(
                     WS_URL,
@@ -65,20 +71,52 @@ class PolymarketWebSocket:
                     ping_timeout=10,
                     close_timeout=5,
                 ) as ws:
+                    self._connections.append(ws)
                     self._consecutive_failures = 0
                     delay = INITIAL_RECONNECT_DELAY
                     logger.info("WebSocket connected, subscribing to %d assets", len(asset_ids))
 
                     # Subscribe
+                    # Per docs: initial subscription uses type=MARKET and assets_ids.
+                    # (User channel needs auth; market channel is public.)
                     subscribe_msg = json.dumps({
-                        "type": "subscribe",
-                        "channel": "market",
+                        "type": "MARKET",
                         "assets_ids": asset_ids,
+                        # Optional custom features
+                        "custom_feature_enabled": True,
                     })
                     await ws.send(subscribe_msg)
 
                     # Listen
                     async for raw in ws:
+                        if self.on_debug and self._debug_raw_remaining > 0:
+                            self._debug_raw_remaining -= 1
+                            # Trim payload to avoid massive OPS spam
+                            preview = raw if len(raw) <= 1200 else raw[:1200] + "…"
+
+                            # Try to parse and summarize structure
+                            summary_lines = []
+                            try:
+                                parsed = json.loads(raw)
+                                if isinstance(parsed, list):
+                                    summary_lines.append(f"kind=list len={len(parsed)}")
+                                    first = parsed[0] if parsed else None
+                                    if isinstance(first, dict):
+                                        summary_lines.append(
+                                            f"first.type={first.get('type')} keys={list(first.keys())[:20]}"
+                                        )
+                                    else:
+                                        summary_lines.append(f"first.kind={type(first).__name__}")
+                                elif isinstance(parsed, dict):
+                                    summary_lines.append(f"kind=dict type={parsed.get('type')} keys={list(parsed.keys())[:30]}")
+                                else:
+                                    summary_lines.append(f"kind={type(parsed).__name__}")
+                            except Exception as exc:
+                                summary_lines.append(f"parse_error={exc}")
+
+                            summary = " | ".join(summary_lines)
+                            await self.on_debug(f"WS raw message (summary): {summary}\nWS raw message (preview):\n{preview}")
+
                         await self._handle_message(raw)
 
             except websockets.ConnectionClosed as exc:
@@ -95,9 +133,18 @@ class PolymarketWebSocket:
                     )
                     if self.on_error:
                         await self.on_error(
-                            ConnectionError(f"Max reconnect attempts ({MAX_RECONNECT_ATTEMPTS}) exceeded")
+                            ConnectionError(
+                                f"Max reconnect attempts ({MAX_RECONNECT_ATTEMPTS}) exceeded"
+                            )
                         )
                     return
+            finally:
+                # Best-effort cleanup of the connection handle
+                try:
+                    if ws is not None and ws in self._connections:
+                        self._connections.remove(ws)
+                except Exception:
+                    pass
 
             if self._running:
                 logger.info("Reconnecting in %.1fs...", delay)
@@ -111,36 +158,64 @@ class PolymarketWebSocket:
         except json.JSONDecodeError:
             return
 
-        msg_type = msg.get("type")
+        # Polymarket sometimes batches messages (e.g. a JSON list of events)
+        if isinstance(msg, list):
+            for item in msg:
+                if isinstance(item, dict):
+                    await self._handle_message(json.dumps(item))
+            return
 
-        if msg_type == "book":
+        if not isinstance(msg, dict):
+            return
+
+        # Messages use event_type (docs) rather than type for events
+        event_type = msg.get("event_type") or msg.get("type")
+
+        if event_type == "book":
             asset_id = msg.get("asset_id", "")
             orderbook = {
                 "bids": [
                     (float(o["price"]), float(o["size"]))
                     for o in msg.get("bids", [])
+                    if isinstance(o, dict) and "price" in o and "size" in o
                 ],
                 "asks": [
                     (float(o["price"]), float(o["size"]))
                     for o in msg.get("asks", [])
+                    if isinstance(o, dict) and "price" in o and "size" in o
                 ],
             }
             await self.on_orderbook_update(asset_id, orderbook)
 
     async def update_subscriptions(self, new_asset_ids: list[str]) -> None:
-        """Update the asset list (requires reconnect)."""
-        self.asset_ids = new_asset_ids
-        logger.info("Subscription list updated (%d assets). Reconnecting...", len(new_asset_ids))
-        await self.close()
-        # The connect loop will restart in main
+        """Update the asset list (forces a reconnect).
 
-    async def close(self) -> None:
-        """Gracefully close all connections."""
-        self._running = False
-        for ws in self._connections:
+        Important: we must NOT stop the main connect loop when refreshing markets,
+        otherwise the websocket task ends and the whole bot may shut down.
+        """
+        self.asset_ids = new_asset_ids
+        logger.info("Subscription list updated (%d assets). Updating subscriptions...", len(new_asset_ids))
+
+        # Per docs: subscribe/unsubscribe message uses operation + assets_ids.
+        # We keep it simple: unsubscribe all then subscribe new, per connection chunking.
+        # For now we force reconnect (close sockets) so connect() will re-chunk and resubscribe.
+        await self.close(stop=False)
+
+    async def close(self, stop: bool = True) -> None:
+        """Gracefully close all connections.
+
+        Args:
+            stop: if True, stop the reconnect loop; if False, only close current
+                  sockets so the loop can reconnect with updated subscriptions.
+        """
+        if stop:
+            self._running = False
+        for ws in list(self._connections):
             try:
                 await ws.close()
             except Exception:
                 pass
         self._connections.clear()
+        # Reset debug budget on reconnect so we can see first messages again
+        self._debug_raw_remaining = self.debug_raw_messages
         logger.info("WebSocket connections closed")

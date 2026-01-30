@@ -13,8 +13,14 @@ class ArbitrageOpportunity:
 
     market_id: str
     market_question: str
+
     yes_token_id: str
     no_token_id: str
+
+    # For linking to Polymarket UI
+    condition_id: str
+    slug: str
+    end_date: str
 
     # Prices
     yes_ask_vwap: float

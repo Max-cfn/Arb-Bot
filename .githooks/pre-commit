@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+
+# Allow bypass for emergencies
+if [[ "${ALLOW_MAIN_COMMIT:-}" == "1" ]]; then
+  exit 0
+fi
+
+if [[ "$branch" == "main" || "$branch" == "master" ]]; then
+  cat >&2 <<'EOF'
+❌ Direct commits to main/master are blocked in this repo.
+
+Create a feature branch:
+  git checkout -b fix/<topic>
+
+If you *really* need to commit on main (emergency), you can bypass once:
+  ALLOW_MAIN_COMMIT=1 git commit ...
+EOF
+  exit 1
+fi
