@@ -33,6 +33,9 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
         "embeds": [
             {
                 "title": opp.market_question[:256],
+                "url": (
+                    f"https://polymarket.com/market/{opp.slug}" if getattr(opp, "slug", "") else None
+                ),
                 "color": color,
                 "fields": [
                     {
@@ -72,6 +75,15 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
                         "name": "Type",
                         "value": "Crypto 15min" if opp.is_crypto_15min else "Standard",
                         "inline": True,
+                    },
+                    {
+                        "name": "Market",
+                        "value": (
+                            f"https://polymarket.com/market/{opp.slug}"
+                            if getattr(opp, "slug", "")
+                            else "(no slug)"
+                        ),
+                        "inline": False,
                     },
                     {
                         "name": "Verdict",
