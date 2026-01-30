@@ -323,6 +323,7 @@ async def main() -> None:
     # --- Setup components ---
     ob_manager = OrderbookManager(markets)
     detector = BinaryArbDetector(config)
+    target_size_usd = config.target_size_usd
 
     # Startup health message
     ip = geo["ip"]
@@ -378,7 +379,7 @@ async def main() -> None:
                 logger.error("Failed to send WS sample to OPS: %s", exc)
 
         for market in affected:
-            opp = detector.detect(market, ob_manager)
+            opp = detector.detect(market, ob_manager, target_size_usd=target_size_usd)
             if opp:
                 await discord.send_opportunity(opp)
                 await db.log_opportunity(opp)
