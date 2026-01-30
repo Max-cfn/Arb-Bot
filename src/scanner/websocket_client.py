@@ -77,12 +77,13 @@ class PolymarketWebSocket:
                     logger.info("WebSocket connected, subscribing to %d assets", len(asset_ids))
 
                     # Subscribe
+                    # Per docs: initial subscription uses type=MARKET and assets_ids.
+                    # (User channel needs auth; market channel is public.)
                     subscribe_msg = json.dumps({
-                        "type": "subscribe",
-                        "channel": "market",
-                        # Polymarket payloads have used both spellings in the wild.
+                        "type": "MARKET",
                         "assets_ids": asset_ids,
-                        "asset_ids": asset_ids,
+                        # Optional custom features
+                        "custom_feature_enabled": True,
                     })
                     await ws.send(subscribe_msg)
 
@@ -167,9 +168,10 @@ class PolymarketWebSocket:
         if not isinstance(msg, dict):
             return
 
-        msg_type = msg.get("type")
+        # Messages use event_type (docs) rather than type for events
+        event_type = msg.get("event_type") or msg.get("type")
 
-        if msg_type == "book":
+        if event_type == "book":
             asset_id = msg.get("asset_id", "")
             orderbook = {
                 "bids": [
@@ -192,7 +194,11 @@ class PolymarketWebSocket:
         otherwise the websocket task ends and the whole bot may shut down.
         """
         self.asset_ids = new_asset_ids
-        logger.info("Subscription list updated (%d assets). Reconnecting...", len(new_asset_ids))
+        logger.info("Subscription list updated (%d assets). Updating subscriptions...", len(new_asset_ids))
+
+        # Per docs: subscribe/unsubscribe message uses operation + assets_ids.
+        # We keep it simple: unsubscribe all then subscribe new, per connection chunking.
+        # For now we force reconnect (close sockets) so connect() will re-chunk and resubscribe.
         await self.close(stop=False)
 
     async def close(self, stop: bool = True) -> None:

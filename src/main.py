@@ -126,11 +126,11 @@ async def ws_probe_subscriptions(discord: DiscordClient, asset_ids: list[str]) -
     probe_assets = asset_ids[:10]
 
     variants: list[dict] = [
-        {"type": "subscribe", "channel": "market", "assets_ids": probe_assets},
-        {"type": "subscribe", "channel": "market", "asset_ids": probe_assets},
-        {"type": "subscribe", "channel": "market", "assets_ids": probe_assets, "asset_ids": probe_assets},
-        {"type": "subscribe", "channel": "book", "asset_ids": probe_assets},
-        {"type": "subscribe", "channel": "orderbook", "asset_ids": probe_assets},
+        # Per docs: initial sub uses type=MARKET + assets_ids
+        {"type": "MARKET", "assets_ids": probe_assets},
+        {"type": "MARKET", "assets_ids": probe_assets, "custom_feature_enabled": True},
+        # Some WS implementations also accept operation-based subscribe
+        {"type": "MARKET", "operation": "subscribe", "assets_ids": probe_assets},
     ]
 
     async def _summarize(raw: str) -> str:
