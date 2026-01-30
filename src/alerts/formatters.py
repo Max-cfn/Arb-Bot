@@ -105,7 +105,8 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
                         "value": (
                             f"YES ask: ${opp.yes_best_ask:.4f}\n"
                             f"NO ask: ${opp.no_best_ask:.4f}\n"
-                            f"Sum: ${opp.combined_best_asks:.4f}"
+                            f"Sum: ${opp.combined_best_asks:.4f}\n"
+                            f"Net: {opp.one_share_net_edge_percent:.2f}% (profit ${opp.one_share_net_profit:.4f})"
                         ),
                         "inline": True,
                     },
