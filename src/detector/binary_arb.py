@@ -89,6 +89,10 @@ def detect_binary_arbitrage(
     yes_asks = yes_orderbook.get("asks", [])
     no_asks = no_orderbook.get("asks", [])
 
+    # Best asks (for simple "1 share" sanity checks / display)
+    best_yes_ask = yes_asks[0][0] if yes_asks else None
+    best_no_ask = no_asks[0][0] if no_asks else None
+
     # Check minimum liquidity
     yes_liq = available_liquidity_usd(yes_asks)
     no_liq = available_liquidity_usd(no_asks)
@@ -136,11 +140,16 @@ def detect_binary_arbitrage(
     return ArbitrageOpportunity(
         market_id=str(market.get("id", "")),
         market_question=market.get("question", ""),
+        yes_token_id=tokens[0].get("token_id", ""),
+        no_token_id=tokens[1].get("token_id", ""),
         condition_id=str(market.get("condition_id", "")),
         slug=str(market.get("slug", "")),
         end_date=str(market.get("end_date", "")),
-        yes_token_id=tokens[0].get("token_id", ""),
-        no_token_id=tokens[1].get("token_id", ""),
+
+        yes_best_ask=float(best_yes_ask or 0.0),
+        no_best_ask=float(best_no_ask or 0.0),
+        combined_best_asks=float((best_yes_ask or 0.0) + (best_no_ask or 0.0)),
+
         yes_ask_vwap=yes_vwap,
         no_ask_vwap=no_vwap,
         combined_cost=combined_cost,

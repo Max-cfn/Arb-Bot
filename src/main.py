@@ -418,9 +418,30 @@ async def main() -> None:
 
         for market in affected:
             opp = detector.detect(market, ob_manager, target_size_usd=target_size_usd)
-            if opp:
-                await discord.send_opportunity(opp)
-                await db.log_opportunity(opp)
+            if not opp:
+                continue
+
+            # USER REQUEST: alert only if net edge strictly > 1.6% AND resolves within 24h
+            try:
+                end_raw = (opp.end_date or "").strip()
+                if not end_raw:
+                    continue
+                end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+                if end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(tzinfo=timezone.utc)
+                hours_left = (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+                if hours_left <= 0:
+                    continue
+                if hours_left > 24:
+                    continue
+            except Exception:
+                continue
+
+            if not (opp.net_edge_percent > 1.6):
+                continue
+
+            await discord.send_opportunity(opp)
+            await db.log_opportunity(opp)
 
     async def on_ws_error(exc: Exception) -> None:
         await discord.send_ops(f"WebSocket error: {exc}")
