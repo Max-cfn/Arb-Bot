@@ -68,11 +68,20 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
                         "inline": True,
                     },
                     {
-                        "name": "Prices",
+                        "name": "Prices (VWAP)",
                         "value": (
                             f"YES: ${opp.yes_ask_vwap:.4f}\n"
                             f"NO: ${opp.no_ask_vwap:.4f}\n"
                             f"Sum: ${opp.combined_cost:.4f}"
+                        ),
+                        "inline": True,
+                    },
+                    {
+                        "name": "Plan (1 YES + 1 NO)",
+                        "value": (
+                            f"YES ask: ${opp.yes_best_ask:.4f}\n"
+                            f"NO ask: ${opp.no_best_ask:.4f}\n"
+                            f"Sum: ${opp.combined_best_asks:.4f}"
                         ),
                         "inline": True,
                     },

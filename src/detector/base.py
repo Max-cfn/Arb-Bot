@@ -23,6 +23,10 @@ class ArbitrageOpportunity:
     end_date: str
 
     # Prices
+    yes_best_ask: float
+    no_best_ask: float
+    combined_best_asks: float
+
     yes_ask_vwap: float
     no_ask_vwap: float
     combined_cost: float
