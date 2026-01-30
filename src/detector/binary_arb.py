@@ -138,6 +138,7 @@ def detect_binary_arbitrage(
         market_question=market.get("question", ""),
         condition_id=str(market.get("condition_id", "")),
         slug=str(market.get("slug", "")),
+        end_date=str(market.get("end_date", "")),
         yes_token_id=tokens[0].get("token_id", ""),
         no_token_id=tokens[1].get("token_id", ""),
         yes_ask_vwap=yes_vwap,

@@ -86,6 +86,11 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
                         "inline": False,
                     },
                     {
+                        "name": "Resolves",
+                        "value": getattr(opp, "end_date", "") or "(unknown)",
+                        "inline": True,
+                    },
+                    {
                         "name": "Verdict",
                         "value": opp.verdict,
                         "inline": True,

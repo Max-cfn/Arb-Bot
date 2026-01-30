@@ -20,6 +20,7 @@ class ArbitrageOpportunity:
     # For linking to Polymarket UI
     condition_id: str
     slug: str
+    end_date: str
 
     # Prices
     yes_ask_vwap: float
