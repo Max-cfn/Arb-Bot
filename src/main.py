@@ -425,10 +425,7 @@ async def main() -> None:
 
     tasks = [
         asyncio.create_task(ws_client.connect(), name="websocket"),
-        asyncio.create_task(
-            periodic_health_check(discord, ob_manager, start_time),
-            name="health",
-        ),
+        # health task disabled (was sending HEALTH webhook every 5 min)
         asyncio.create_task(
             periodic_ops_debug(discord, ob_manager, start_time),
             name="ops_debug",
