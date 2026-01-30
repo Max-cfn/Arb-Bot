@@ -282,12 +282,18 @@ async def main() -> None:
     async def on_ws_error(exc: Exception) -> None:
         await discord.send_ops(f"WebSocket error: {exc}")
 
+    async def on_ws_debug(msg: str) -> None:
+        # Keep debug visible in the OPS channel
+        await discord.send_ops(msg)
+
     # --- WebSocket client ---
     asset_ids = extract_all_token_ids(markets)
     ws_client = PolymarketWebSocket(
         asset_ids=asset_ids,
         on_orderbook_update=on_orderbook_update,
         on_error=on_ws_error,
+        on_debug=on_ws_debug,
+        debug_raw_messages=3,
     )
 
     # --- Graceful shutdown ---

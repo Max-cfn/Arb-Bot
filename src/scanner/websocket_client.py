@@ -25,13 +25,18 @@ class PolymarketWebSocket:
         asset_ids: list[str],
         on_orderbook_update: Callable[[str, dict], Awaitable[None]],
         on_error: Callable[[Exception], Awaitable[None]] | None = None,
+        on_debug: Callable[[str], Awaitable[None]] | None = None,
+        debug_raw_messages: int = 3,
     ):
         self.asset_ids = asset_ids
         self.on_orderbook_update = on_orderbook_update
         self.on_error = on_error
+        self.on_debug = on_debug
+        self.debug_raw_messages = debug_raw_messages
         self._connections: list[websockets.WebSocketClientProtocol] = []
         self._running = False
         self._consecutive_failures = 0
+        self._debug_raw_remaining = debug_raw_messages
 
     async def connect(self) -> None:
         """Start WebSocket connections (splits assets across connections if needed)."""
@@ -83,6 +88,11 @@ class PolymarketWebSocket:
 
                     # Listen
                     async for raw in ws:
+                        if self.on_debug and self._debug_raw_remaining > 0:
+                            self._debug_raw_remaining -= 1
+                            # Trim payload to avoid massive OPS spam
+                            preview = raw if len(raw) <= 1200 else raw[:1200] + "…"
+                            await self.on_debug(f"WS raw message (preview):\n{preview}")
                         await self._handle_message(raw)
 
             except websockets.ConnectionClosed as exc:
@@ -177,4 +187,6 @@ class PolymarketWebSocket:
             except Exception:
                 pass
         self._connections.clear()
+        # Reset debug budget on reconnect so we can see first messages again
+        self._debug_raw_remaining = self.debug_raw_messages
         logger.info("WebSocket connections closed")
