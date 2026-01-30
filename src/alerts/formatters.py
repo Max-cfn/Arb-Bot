@@ -19,22 +19,46 @@ EMBED_COLORS = {
 PARIS_TZ = ZoneInfo("Europe/Paris")
 
 
-def _format_resolve_time_paris(end_date: str) -> str:
-    """Format an ISO end_date (usually UTC/Z) into Europe/Paris time."""
+def _parse_end_date(end_date: str) -> datetime | None:
     if not end_date:
-        return "(unknown)"
-
+        return None
     try:
-        # Gamma uses e.g. 2026-01-30T16:00:00Z
         dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        paris = dt.astimezone(PARIS_TZ)
-        # Example: 2026-01-30 17:00 (Europe/Paris)
-        return paris.strftime("%Y-%m-%d %H:%M") + " (Paris)"
+        return dt
     except Exception:
-        # Fallback to raw string
-        return end_date
+        return None
+
+
+def _format_resolve_time_paris(end_date: str) -> str:
+    """Format an ISO end_date (usually UTC/Z) into Europe/Paris time."""
+    dt = _parse_end_date(end_date)
+    if not dt:
+        return end_date or "(unknown)"
+
+    paris = dt.astimezone(PARIS_TZ)
+    return paris.strftime("%Y-%m-%d %H:%M") + " (Paris)"
+
+
+def _format_time_left(end_date: str) -> str:
+    dt = _parse_end_date(end_date)
+    if not dt:
+        return "(unknown)"
+
+    now = datetime.now(timezone.utc)
+    delta_s = (dt - now).total_seconds()
+    if delta_s <= 0:
+        return "0m"
+
+    total_m = int(delta_s // 60)
+    h, m = divmod(total_m, 60)
+    if h >= 48:
+        d, h2 = divmod(h, 24)
+        return f"{d}d {h2}h"
+    if h > 0:
+        return f"{h}h {m}m"
+    return f"{m}m"
 
 
 def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
@@ -118,6 +142,11 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
                     {
                         "name": "Resolves",
                         "value": _format_resolve_time_paris(getattr(opp, "end_date", "")),
+                        "inline": True,
+                    },
+                    {
+                        "name": "Time left",
+                        "value": _format_time_left(getattr(opp, "end_date", "")),
                         "inline": True,
                     },
                     {
