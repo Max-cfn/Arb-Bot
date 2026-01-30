@@ -24,6 +24,10 @@ class Config:
     scan_interval_seconds: float = 1.0
     target_size_usd: float = 100.0
 
+    # Market universe selection (aggressive scanning)
+    market_min_liquidity_usd: float = 500.0
+    market_min_volume_usd: float = 500.0
+
     # Safety buffers
     buffer_liquid_percent: float = 0.5
     buffer_illiquid_percent: float = 1.0
@@ -69,6 +73,8 @@ def load_config(env_path: str | None = None) -> Config:
         max_markets_watch=int(os.getenv("MAX_MARKETS_WATCH", "500")),
         scan_interval_seconds=float(os.getenv("SCAN_INTERVAL_SECONDS", "1")),
         target_size_usd=float(os.getenv("TARGET_SIZE_USD", "100")),
+        market_min_liquidity_usd=float(os.getenv("MARKET_MIN_LIQUIDITY_USD", "500")),
+        market_min_volume_usd=float(os.getenv("MARKET_MIN_VOLUME_USD", "500")),
         buffer_liquid_percent=float(os.getenv("BUFFER_LIQUID_PERCENT", "0.5")),
         buffer_illiquid_percent=float(os.getenv("BUFFER_ILLIQUID_PERCENT", "1.0")),
         illiquid_threshold_usd=float(os.getenv("ILLIQUID_THRESHOLD_USD", "1000")),

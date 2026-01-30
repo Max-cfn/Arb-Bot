@@ -58,21 +58,48 @@ async def periodic_health_check(
             logger.error("Health check failed: %s", exc)
 
 
+def select_markets(
+    markets: list[dict],
+    max_markets: int,
+    min_liquidity_usd: float,
+    min_volume_usd: float,
+) -> list[dict]:
+    """Select a market universe.
+
+    Aggressive OR filter: keep markets with liquidity>=min_liquidity_usd OR volume>=min_volume_usd.
+    Then sort by (liquidity + volume) descending and take top max_markets.
+    """
+    filtered = [
+        m for m in markets
+        if (float(m.get("liquidity", 0) or 0) >= min_liquidity_usd)
+        or (float(m.get("volume", 0) or 0) >= min_volume_usd)
+    ]
+    filtered.sort(
+        key=lambda m: float(m.get("liquidity", 0) or 0) + float(m.get("volume", 0) or 0),
+        reverse=True,
+    )
+    return filtered[:max_markets]
+
+
 async def periodic_market_refresh(
     ob_manager: OrderbookManager,
     ws_client: PolymarketWebSocket,
     max_markets: int,
+    min_liquidity_usd: float,
+    min_volume_usd: float,
 ) -> None:
     """Refresh the active market list periodically."""
     while True:
         await asyncio.sleep(MARKET_REFRESH_INTERVAL)
         try:
-            new_markets = await fetch_active_markets(max_markets)
+            # Fetch a larger pool, then filter/sort down to our watchlist.
+            pool = await fetch_active_markets(50000)
+            new_markets = select_markets(pool, max_markets, min_liquidity_usd, min_volume_usd)
             if new_markets:
                 ob_manager.load_markets(new_markets)
                 new_ids = extract_all_token_ids(new_markets)
                 await ws_client.update_subscriptions(new_ids)
-                logger.info("Refreshed markets: %d active", len(new_markets))
+                logger.info("Refreshed markets: %d active (filtered from %d)", len(new_markets), len(pool))
         except Exception as exc:
             logger.error("Market refresh failed: %s", exc)
 
@@ -312,13 +339,24 @@ async def main() -> None:
 
     # --- Fetch markets ---
     logger.info("Fetching active markets...")
-    markets = await fetch_active_markets(config.max_markets_watch)
+    # Fetch a large pool then select a watchlist (more stable than taking the first N).
+    pool = await fetch_active_markets(50000)
+    markets = select_markets(
+        pool,
+        config.max_markets_watch,
+        config.market_min_liquidity_usd,
+        config.market_min_volume_usd,
+    )
     if not markets:
-        logger.error("No markets found. Exiting.")
-        await discord.send_ops("CRITICAL: No active markets found, bot cannot start")
+        logger.error("No markets found after filtering. Exiting.")
+        await discord.send_ops("CRITICAL: No markets found after filtering, bot cannot start")
         sys.exit(1)
 
-    logger.info("Loaded %d markets", len(markets))
+    logger.info(
+        "Loaded %d markets (filtered from %d)",
+        len(markets),
+        len(pool),
+    )
 
     # --- Setup components ---
     ob_manager = OrderbookManager(markets)
@@ -432,7 +470,13 @@ async def main() -> None:
             name="ops_debug",
         ),
         asyncio.create_task(
-            periodic_market_refresh(ob_manager, ws_client, config.max_markets_watch),
+            periodic_market_refresh(
+                ob_manager,
+                ws_client,
+                config.max_markets_watch,
+                config.market_min_liquidity_usd,
+                config.market_min_volume_usd,
+            ),
             name="market_refresh",
         ),
         asyncio.create_task(
