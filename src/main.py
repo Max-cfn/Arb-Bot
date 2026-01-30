@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import signal
 import sys
 import time
@@ -262,6 +263,36 @@ async def main() -> None:
         sys.exit(1)
 
     discord = DiscordClient(config)
+
+    # One-time debug: send a fake opportunity message to validate the Discord webhook.
+    # Controlled by env var so we don't spam.
+    if ("" + str(os.getenv("SEND_FAKE_OPP_ONCE", ""))).strip() == "1":
+        try:
+            from src.detector.base import ArbitrageOpportunity
+            fake = ArbitrageOpportunity(
+                market_id="DEBUG",
+                market_question="DEBUG: webhook test opportunity (ignore)",
+                yes_token_id="DEBUG_YES",
+                no_token_id="DEBUG_NO",
+                yes_ask_vwap=0.49,
+                no_ask_vwap=0.49,
+                combined_cost=0.98,
+                gross_edge=0.02,
+                gross_edge_percent=2.04,
+                net_edge=0.02,
+                net_edge_percent=2.04,
+                size_usd=100.0,
+                yes_liquidity=1000.0,
+                no_liquidity=1000.0,
+                max_safe_size=500.0,
+                timestamp=datetime.now(timezone.utc),
+                is_crypto_15min=False,
+                verdict="ACTIONABLE",
+            )
+            await discord.send_opportunity(fake)
+            await discord.send_ops("DEBUG: sent one fake opportunity (SEND_FAKE_OPP_ONCE=1)")
+        except Exception as exc:
+            logger.error("Failed to send fake opportunity: %s", exc)
 
     # --- Geoblock check ---
     logger.info("Checking geoblock status...")
