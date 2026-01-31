@@ -550,9 +550,12 @@ async def main() -> None:
         except Exception as exc:
             logger.error("One-shot health ping failed: %s", exc)
 
+    # Fire-and-forget one-shot health ping (do NOT put it in the main task list,
+    # otherwise it completes and triggers shutdown when we wait for FIRST_COMPLETED).
+    asyncio.create_task(_send_running_health_once(), name="health_once")
+
     tasks = [
         asyncio.create_task(ws_client.connect(), name="websocket"),
-        asyncio.create_task(_send_running_health_once(), name="health_once"),
         asyncio.create_task(
             periodic_ops_debug(discord, ob_manager, start_time),
             name="ops_debug",
@@ -579,7 +582,7 @@ async def main() -> None:
         shutdown_task = asyncio.create_task(shutdown_event.wait())
         done, _ = await asyncio.wait(
             [*tasks, shutdown_task],
-            return_when=asyncio.FIRST_COMPLETED,
+            return_when=asyncio.FIRST_EXCEPTION,
         )
         for t in done:
             if t != shutdown_task and t.exception():
