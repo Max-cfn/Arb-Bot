@@ -9,6 +9,7 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from src.alerts.discord import DiscordClient
 from src.config import load_config
@@ -33,6 +34,36 @@ DEBUG_OPS_INTERVAL = 60      # 1 min
 WS_PROBE_ON_START = True
 WS_PROBE_TIMEOUT_S = 6.0
 WS_PROBE_MAX_MSGS = 4
+
+# Trading control (killswitch)
+CONTROL_FILE = Path(os.getenv("POLY_CONTROL_FILE", "data/control.json"))
+
+
+def is_trading_enabled() -> bool:
+    """Return whether trading/execution is enabled.
+
+    This is intended to be toggled via Discord admin commands (or manually).
+
+    control.json example:
+      {"trading_enabled": true}
+    """
+    env_override = os.getenv("TRADING_ENABLED")
+    if env_override is not None:
+        return env_override.strip() not in {"0", "false", "False", "no", "NO"}
+
+    try:
+        data = json.loads(CONTROL_FILE.read_text())
+        # allow a couple of keys for compatibility
+        if "trading_enabled" in data:
+            return bool(data["trading_enabled"])
+        if "killswitch" in data:
+            return str(data["killswitch"]).strip() not in {"1", "on", "true", "True"}
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return True
+
+    return True
 
 
 async def periodic_health_check(
@@ -456,6 +487,10 @@ async def main() -> None:
 
             # Dry-run execution plan: show what we'd do (no orders placed).
             # Cooldown per market to avoid spam.
+            # If killswitch is OFF, we keep scanning/alerting but do not emit execution/trading actions.
+            if not is_trading_enabled():
+                return
+
             try:
                 if not hasattr(on_orderbook_update, "_exec_last"):  # type: ignore[attr-defined]
                     on_orderbook_update._exec_last = {}  # type: ignore[attr-defined]
