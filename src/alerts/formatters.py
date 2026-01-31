@@ -74,7 +74,7 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
         ping = ""
 
     return {
-        "content": f"{ping}**Arbitrage Detected**",
+        "content": f"{ping}**Arbitrage Detected {opp.net_edge_percent:.1f}%**",
         "embeds": [
             {
                 "title": opp.market_question[:256],
