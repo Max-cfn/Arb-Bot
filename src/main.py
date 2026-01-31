@@ -421,7 +421,10 @@ async def main() -> None:
             if not opp:
                 continue
 
-            # USER REQUEST: alert only if net edge strictly > 1.6% AND resolves within 24h
+            # USER REQUEST: tiered edge thresholds by time-to-resolution
+            # - < 15 min:  net > 2.0%
+            # - 15 min–4h: net > 3.5%
+            # - 4h–24h:    net > 5.0%
             try:
                 end_raw = (opp.end_date or "").strip()
                 if not end_raw:
@@ -434,10 +437,17 @@ async def main() -> None:
                     continue
                 if hours_left > 24:
                     continue
-            except Exception:
-                continue
 
-            if not (opp.net_edge_percent > 1.6):
+                if hours_left < 0.25:
+                    min_net = 2.0
+                elif hours_left < 4.0:
+                    min_net = 3.5
+                else:
+                    min_net = 5.0
+
+                if not (opp.net_edge_percent > min_net):
+                    continue
+            except Exception:
                 continue
 
             # Always send an opportunity alert
