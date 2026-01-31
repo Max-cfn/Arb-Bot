@@ -440,8 +440,25 @@ async def main() -> None:
             if not (opp.net_edge_percent > 1.6):
                 continue
 
+            # Always send an opportunity alert
             await discord.send_opportunity(opp)
             await db.log_opportunity(opp)
+
+            # Dry-run execution plan: show what we'd do (no orders placed).
+            # Cooldown per market to avoid spam.
+            try:
+                if not hasattr(on_orderbook_update, "_exec_last"):  # type: ignore[attr-defined]
+                    on_orderbook_update._exec_last = {}  # type: ignore[attr-defined]
+                last = on_orderbook_update._exec_last.get(opp.market_id, 0)  # type: ignore[attr-defined]
+                now_ts = time.time()
+                if now_ts - last > 60:
+                    on_orderbook_update._exec_last[opp.market_id] = now_ts  # type: ignore[attr-defined]
+                    await discord.send_execution(
+                        opp,
+                        note="Strategy: strict limit, send both ASAP; cancel fast; if single-fill => unwind immediately (dry-run).",
+                    )
+            except Exception:
+                pass
 
     async def on_ws_error(exc: Exception) -> None:
         await discord.send_ops(f"WebSocket error: {exc}")
