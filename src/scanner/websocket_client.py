@@ -18,7 +18,15 @@ MAX_RECONNECT_ATTEMPTS = 5
 
 
 class PolymarketWebSocket:
-    """Manages one or more WebSocket connections to Polymarket CLOB."""
+    """Manages one or more WebSocket connections to Polymarket CLOB.
+
+    NOTE: We need to support refreshing subscriptions when the market universe changes.
+    The old implementation passed a fixed `asset_ids` chunk into each connection task.
+    After `update_subscriptions()`, tasks would reconnect with stale chunks.
+
+    This implementation runs a small supervisor loop that can cancel/recreate
+    connection tasks whenever subscriptions are refreshed.
+    """
 
     def __init__(
         self,
@@ -38,25 +46,65 @@ class PolymarketWebSocket:
         self._consecutive_failures = 0
         self._debug_raw_remaining = debug_raw_messages
 
+        # refresh mechanism
+        self._refresh_event = asyncio.Event()
+        self._tasks: list[asyncio.Task] = []
+
     async def connect(self) -> None:
-        """Start WebSocket connections (splits assets across connections if needed)."""
+        """Start WebSocket connections and keep them alive.
+
+        This function is long-running. It will re-chunk and resubscribe whenever
+        `update_subscriptions()` is called.
+        """
         self._running = True
-        chunks = [
-            self.asset_ids[i : i + MAX_ASSETS_PER_CONNECTION]
-            for i in range(0, len(self.asset_ids), MAX_ASSETS_PER_CONNECTION)
-        ]
 
-        if not chunks:
-            logger.warning("No asset IDs to subscribe to")
-            return
+        while self._running:
+            chunks = [
+                self.asset_ids[i : i + MAX_ASSETS_PER_CONNECTION]
+                for i in range(0, len(self.asset_ids), MAX_ASSETS_PER_CONNECTION)
+            ]
 
-        logger.info(
-            "Starting %d WebSocket connection(s) for %d assets",
-            len(chunks), len(self.asset_ids),
-        )
+            if not chunks:
+                logger.warning("No asset IDs to subscribe to")
+                # Wait for refresh (or stop)
+                await asyncio.sleep(2)
+                continue
 
-        tasks = [self._run_connection(chunk) for chunk in chunks]
-        await asyncio.gather(*tasks)
+            logger.info(
+                "Starting %d WebSocket connection(s) for %d assets",
+                len(chunks), len(self.asset_ids),
+            )
+
+            # Spawn connection tasks
+            self._tasks = [asyncio.create_task(self._run_connection(chunk)) for chunk in chunks]
+
+            # Wait until a refresh is requested or until any task fails/exits
+            refresh_wait = asyncio.create_task(self._refresh_event.wait())
+            done, pending = await asyncio.wait(
+                [*self._tasks, refresh_wait],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # If we were asked to refresh, close sockets & restart loop
+            if refresh_wait in done and self._refresh_event.is_set():
+                self._refresh_event.clear()
+                await self.close(stop=False)
+
+            # Cancel any remaining tasks (we will recreate next loop iteration)
+            for t in self._tasks:
+                if not t.done():
+                    t.cancel()
+            for p in pending:
+                if p is not refresh_wait and not p.done():
+                    p.cancel()
+
+            # Drain cancellations
+            await asyncio.gather(*[t for t in self._tasks if t], return_exceptions=True)
+            self._tasks = []
+
+            # Small backoff to avoid tight loop on repeated failures
+            if self._running:
+                await asyncio.sleep(0.2)
 
     async def _run_connection(self, asset_ids: list[str]) -> None:
         """Run a single WebSocket connection with reconnection logic."""
@@ -171,6 +219,7 @@ class PolymarketWebSocket:
         # Messages use event_type (docs) rather than type for events
         event_type = msg.get("event_type") or msg.get("type")
 
+        # 1) Full book snapshots
         if event_type == "book":
             asset_id = msg.get("asset_id", "")
             orderbook = {
@@ -186,20 +235,59 @@ class PolymarketWebSocket:
                 ],
             }
             await self.on_orderbook_update(asset_id, orderbook)
+            return
+
+        # 2) Lightweight deltas / signals
+        # We DO receive these (see ops-logs): price_change, best_bid_ask.
+        # They are not full depth, but they can keep top-of-book fresher between snapshots.
+        if event_type == "best_bid_ask":
+            asset_id = msg.get("asset_id", "")
+            try:
+                best_bid = float(msg.get("best_bid") or 0.0)
+                best_ask = float(msg.get("best_ask") or 0.0)
+            except Exception:
+                return
+
+            # Represent as a 1-level book update; OrderbookManager truncates anyway.
+            orderbook = {
+                "bids": [(best_bid, 0.0)] if best_bid > 0 else [],
+                "asks": [(best_ask, 0.0)] if best_ask > 0 else [],
+            }
+            await self.on_orderbook_update(asset_id, orderbook)
+            return
+
+        if event_type == "price_change":
+            # price_changes contains best_bid/best_ask per asset_id
+            pcs = msg.get("price_changes")
+            if not isinstance(pcs, list):
+                return
+            for item in pcs:
+                if not isinstance(item, dict):
+                    continue
+                asset_id = str(item.get("asset_id") or "")
+                if not asset_id:
+                    continue
+                try:
+                    best_bid = float(item.get("best_bid") or 0.0)
+                    best_ask = float(item.get("best_ask") or 0.0)
+                except Exception:
+                    continue
+                orderbook = {
+                    "bids": [(best_bid, 0.0)] if best_bid > 0 else [],
+                    "asks": [(best_ask, 0.0)] if best_ask > 0 else [],
+                }
+                await self.on_orderbook_update(asset_id, orderbook)
+            return
 
     async def update_subscriptions(self, new_asset_ids: list[str]) -> None:
-        """Update the asset list (forces a reconnect).
-
-        Important: we must NOT stop the main connect loop when refreshing markets,
-        otherwise the websocket task ends and the whole bot may shut down.
-        """
+        """Update the asset list and trigger a re-chunk + resubscribe."""
         self.asset_ids = new_asset_ids
-        logger.info("Subscription list updated (%d assets). Updating subscriptions...", len(new_asset_ids))
-
-        # Per docs: subscribe/unsubscribe message uses operation + assets_ids.
-        # We keep it simple: unsubscribe all then subscribe new, per connection chunking.
-        # For now we force reconnect (close sockets) so connect() will re-chunk and resubscribe.
-        await self.close(stop=False)
+        logger.info(
+            "Subscription list updated (%d assets). Triggering resubscribe...",
+            len(new_asset_ids),
+        )
+        # Signal the supervisor loop to restart connections with fresh chunks.
+        self._refresh_event.set()
 
     async def close(self, stop: bool = True) -> None:
         """Gracefully close all connections.

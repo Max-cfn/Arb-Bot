@@ -28,8 +28,12 @@ async def fetch_active_markets(max_markets: int = 500) -> list[dict]:
                 )
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status != 200:
-                        logger.warning("Gamma API returned %d at offset %d", resp.status, offset)
-                        break
+                        body = ""
+                        try:
+                            body = (await resp.text())[:400]
+                        except Exception:
+                            body = ""
+                        raise RuntimeError(f"Gamma API HTTP {resp.status} offset={offset} body={body}")
 
                     batch = await resp.json()
                     if not batch:
