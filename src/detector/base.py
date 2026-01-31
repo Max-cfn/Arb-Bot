@@ -27,6 +27,11 @@ class ArbitrageOpportunity:
     no_best_ask: float
     combined_best_asks: float
 
+    # One-share plan (buy 1 YES + 1 NO)
+    one_share_net_profit: float
+    one_share_net_edge_percent: float
+
+    # VWAP-based (size_usd per side)
     yes_ask_vwap: float
     no_ask_vwap: float
     combined_cost: float

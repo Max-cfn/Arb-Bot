@@ -32,7 +32,6 @@ def _parse_end_date(end_date: str) -> datetime | None:
 
 
 def _format_resolve_time_paris(end_date: str) -> str:
-    """Format an ISO end_date (usually UTC/Z) into Europe/Paris time."""
     dt = _parse_end_date(end_date)
     if not dt:
         return end_date or "(unknown)"
@@ -74,12 +73,14 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
         ping = ""
 
     return {
-        "content": f"{ping}**Arbitrage Detected**",
+        "content": f"{ping}**Arbitrage Detected {opp.net_edge_percent:.1f}%**",
         "embeds": [
             {
                 "title": opp.market_question[:256],
                 "url": (
-                    f"https://polymarket.com/market/{opp.slug}" if getattr(opp, "slug", "") else None
+                    f"https://polymarket.com/market/{opp.slug}"
+                    if getattr(opp, "slug", "")
+                    else None
                 ),
                 "color": color,
                 "fields": [
@@ -105,7 +106,8 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
                         "value": (
                             f"YES ask: ${opp.yes_best_ask:.4f}\n"
                             f"NO ask: ${opp.no_best_ask:.4f}\n"
-                            f"Sum: ${opp.combined_best_asks:.4f}"
+                            f"Sum: ${opp.combined_best_asks:.4f}\n"
+                            f"Net: {opp.one_share_net_edge_percent:.2f}% (profit ${opp.one_share_net_profit:.4f})"
                         ),
                         "inline": True,
                     },
@@ -155,10 +157,54 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
                         "inline": True,
                     },
                 ],
-                "footer": {"text": f"Market ID: {opp.market_id[:16]}..."},
+                "footer": {"text": f"Market ID: {str(opp.market_id)[:16]}..."},
                 "timestamp": opp.timestamp.isoformat(),
             }
         ],
+    }
+
+
+def format_execution_embed(
+    opp: ArbitrageOpportunity,
+    note: str = "",
+    *,
+    run_id: str = "",
+    status: str = "PLANNED",
+) -> dict[str, Any]:
+    """Format a DRY-RUN execution message.
+
+    status examples: PLANNED, SUBMITTED, WAITING, CANCELLED, UNWIND
+    """
+    url = f"https://polymarket.com/market/{opp.slug}" if getattr(opp, "slug", "") else ""
+
+    header = f"DRY-RUN execution | {status}"
+    if run_id:
+        header += f" | run={run_id}"
+
+    desc_lines = [
+        header,
+        f"Market: {url}" if url else "Market: (no slug)",
+        f"Resolves: {_format_resolve_time_paris(getattr(opp, 'end_date', ''))} | left: {_format_time_left(getattr(opp, 'end_date', ''))}",
+        "",
+        "Orders (intended):",
+        f"- BUY 1 YES @ {opp.yes_best_ask:.4f}",
+        f"- BUY 1 NO  @ {opp.no_best_ask:.4f}",
+        f"- Combined best asks: {opp.combined_best_asks:.4f}",
+        f"- 1-share net: {opp.one_share_net_edge_percent:.2f}% (profit {opp.one_share_net_profit:.4f})",
+    ]
+    if note:
+        desc_lines.append("")
+        desc_lines.append(note)
+
+    return {
+        "embeds": [
+            {
+                "title": f"Execution (dry-run) | net {opp.net_edge_percent:.1f}%",
+                "description": "\n".join(desc_lines)[:4000],
+                "color": EMBED_COLORS["info"],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        ]
     }
 
 

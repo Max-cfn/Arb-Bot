@@ -9,6 +9,7 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from src.alerts.discord import DiscordClient
 from src.config import load_config
@@ -33,6 +34,36 @@ DEBUG_OPS_INTERVAL = 60      # 1 min
 WS_PROBE_ON_START = True
 WS_PROBE_TIMEOUT_S = 6.0
 WS_PROBE_MAX_MSGS = 4
+
+# Trading control (killswitch)
+CONTROL_FILE = Path(os.getenv("POLY_CONTROL_FILE", "data/control.json"))
+
+
+def is_trading_enabled() -> bool:
+    """Return whether trading/execution is enabled.
+
+    This is intended to be toggled via Discord admin commands (or manually).
+
+    control.json example:
+      {"trading_enabled": true}
+    """
+    env_override = os.getenv("TRADING_ENABLED")
+    if env_override is not None:
+        return env_override.strip() not in {"0", "false", "False", "no", "NO"}
+
+    try:
+        data = json.loads(CONTROL_FILE.read_text())
+        # allow a couple of keys for compatibility
+        if "trading_enabled" in data:
+            return bool(data["trading_enabled"])
+        if "killswitch" in data:
+            return str(data["killswitch"]).strip() not in {"1", "on", "true", "True"}
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return True
+
+    return True
 
 
 async def periodic_health_check(
@@ -421,7 +452,10 @@ async def main() -> None:
             if not opp:
                 continue
 
-            # USER REQUEST: alert only if net edge strictly > 1.6% AND resolves within 24h
+            # USER REQUEST: tiered edge thresholds by time-to-resolution
+            # - < 15 min:  net > 2.0%
+            # - 15 min–4h: net > 3.5%
+            # - 4h–24h:    net > 5.0%
             try:
                 end_raw = (opp.end_date or "").strip()
                 if not end_raw:
@@ -434,14 +468,69 @@ async def main() -> None:
                     continue
                 if hours_left > 24:
                     continue
+
+                if hours_left < 0.25:
+                    min_net = 2.0
+                elif hours_left < 4.0:
+                    min_net = 3.5
+                else:
+                    min_net = 5.0
+
+                if not (opp.net_edge_percent > min_net):
+                    continue
             except Exception:
                 continue
 
-            if not (opp.net_edge_percent > 1.6):
-                continue
-
+            # Always send an opportunity alert
             await discord.send_opportunity(opp)
             await db.log_opportunity(opp)
+
+            # Dry-run execution plan: show what we'd do (no orders placed).
+            # Cooldown per market to avoid spam.
+            # If killswitch is OFF, we keep scanning/alerting but do not emit execution/trading actions.
+            if not is_trading_enabled():
+                return
+
+            try:
+                if not hasattr(on_orderbook_update, "_exec_last"):  # type: ignore[attr-defined]
+                    on_orderbook_update._exec_last = {}  # type: ignore[attr-defined]
+                last = on_orderbook_update._exec_last.get(opp.market_id, 0)  # type: ignore[attr-defined]
+                now_ts = time.time()
+                if now_ts - last > 60:
+                    on_orderbook_update._exec_last[opp.market_id] = now_ts  # type: ignore[attr-defined]
+                    # Simulated state machine (dry-run): SUBMITTED -> WAITING -> CANCELLED
+                    run_id = f"{opp.market_id}-{int(now_ts)}"
+                    await discord.send_execution(
+                        opp,
+                        note="Strategy: strict limit, send both ASAP; cancel fast; if single-fill => unwind immediately (dry-run).",
+                        run_id=run_id,
+                        status="SUBMITTED",
+                    )
+
+                    async def _simulate_states() -> None:
+                        # WAITING
+                        await asyncio.sleep(1.5)
+                        await discord.send_execution(
+                            opp,
+                            note="No fill within timeout => would cancel both orders.",
+                            run_id=run_id,
+                            status="WAITING",
+                        )
+                        # CANCELLED
+                        await asyncio.sleep(0.2)
+                        await discord.send_execution(
+                            opp,
+                            note=(
+                                "CANCELLED (simulated). If only one leg had filled, "
+                                "we would immediately unwind that leg (market/aggro limit)."
+                            ),
+                            run_id=run_id,
+                            status="CANCELLED",
+                        )
+
+                    asyncio.create_task(_simulate_states(), name=f"dryrun-{opp.market_id}")
+            except Exception:
+                pass
 
     async def on_ws_error(exc: Exception) -> None:
         await discord.send_ops(f"WebSocket error: {exc}")
@@ -483,9 +572,25 @@ async def main() -> None:
     # --- Launch tasks ---
     logger.info("Starting bot (watching %d assets)...", len(asset_ids))
 
+    async def _send_running_health_once() -> None:
+        # Give WS a moment to connect and start receiving books.
+        await asyncio.sleep(20)
+        try:
+            stats = ob_manager.get_stats()
+            await discord.send_health("Running", {
+                "Markets": stats.get("total_markets"),
+                "Assets tracked": stats.get("tracked_assets"),
+                "Stale books": stats.get("stale_books"),
+            })
+        except Exception as exc:
+            logger.error("One-shot health ping failed: %s", exc)
+
+    # Fire-and-forget one-shot health ping (do NOT put it in the main task list,
+    # otherwise it completes and triggers shutdown when we wait for FIRST_COMPLETED).
+    asyncio.create_task(_send_running_health_once(), name="health_once")
+
     tasks = [
         asyncio.create_task(ws_client.connect(), name="websocket"),
-        # health task disabled (was sending HEALTH webhook every 5 min)
         asyncio.create_task(
             periodic_ops_debug(discord, ob_manager, start_time),
             name="ops_debug",
@@ -512,7 +617,7 @@ async def main() -> None:
         shutdown_task = asyncio.create_task(shutdown_event.wait())
         done, _ = await asyncio.wait(
             [*tasks, shutdown_task],
-            return_when=asyncio.FIRST_COMPLETED,
+            return_when=asyncio.FIRST_EXCEPTION,
         )
         for t in done:
             if t != shutdown_task and t.exception():

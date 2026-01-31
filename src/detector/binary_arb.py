@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from src.config import Config
 from src.detector.base import ArbitrageOpportunity, BaseDetector
-from src.detector.fees import calculate_polymarket_fees
+from src.detector.fees import calculate_polymarket_fees, calculate_polymarket_fees_for_shares
 from src.detector.vwap import available_liquidity_usd, calculate_vwap
 from src.scanner.orderbook_manager import OrderbookManager
 from src.utils.logger import logger
@@ -118,6 +118,14 @@ def detect_binary_arbitrage(
     is_crypto = bool(market.get("is_crypto_15min", False))
     fees = calculate_polymarket_fees(yes_vwap, no_vwap, target_size_usd, is_crypto)
 
+    # "Buy 1 YES + 1 NO" plan (best-ask based)
+    one_share = calculate_polymarket_fees_for_shares(
+        yes_price=float(best_yes_ask or 0.0),
+        no_price=float(best_no_ask or 0.0),
+        shares=1.0,
+        is_crypto_15min=is_crypto,
+    )
+
     net_edge = fees["net_profit"] / target_size_usd if target_size_usd > 0 else 0
     net_edge_percent = (net_edge / combined_cost) * 100 if combined_cost > 0 else 0
 
@@ -149,6 +157,9 @@ def detect_binary_arbitrage(
         yes_best_ask=float(best_yes_ask or 0.0),
         no_best_ask=float(best_no_ask or 0.0),
         combined_best_asks=float((best_yes_ask or 0.0) + (best_no_ask or 0.0)),
+
+        one_share_net_profit=float(one_share.get("net_profit", 0.0)),
+        one_share_net_edge_percent=float(one_share.get("net_edge_percent", 0.0)),
 
         yes_ask_vwap=yes_vwap,
         no_ask_vwap=no_vwap,

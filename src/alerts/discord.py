@@ -12,6 +12,7 @@ from src.alerts.formatters import (
     format_health_embed,
     format_ops_embed,
     format_opportunity_embed,
+    format_execution_embed,
 )
 from src.config import Config
 from src.detector.base import ArbitrageOpportunity
@@ -30,6 +31,7 @@ class DiscordClient:
             "ops": config.discord_webhook_ops,
             "daily": config.discord_webhook_daily,
             "opportunities": config.discord_webhook_opportunities,
+            "executions": config.discord_webhook_executions,
         }
         self._last_send: float = 0
 
@@ -78,6 +80,22 @@ class DiscordClient:
             opp.market_question[:60], opp.net_edge_percent,
         )
         return await self._send("opportunities", payload)
+
+    async def send_execution(
+        self,
+        opp: ArbitrageOpportunity,
+        note: str = "",
+        *,
+        run_id: str = "",
+        status: str = "PLANNED",
+    ) -> bool:
+        """Send a dry-run execution plan (or later real execution status)."""
+        payload = format_execution_embed(opp, note=note, run_id=run_id, status=status)
+        # Prefer executions channel if configured; otherwise fall back to ops.
+        ok = await self._send("executions", payload)
+        if not ok:
+            return await self._send("ops", payload)
+        return ok
 
     async def send_health(self, status: str, details: dict[str, Any] | None = None) -> bool:
         """Send a health-check message."""
