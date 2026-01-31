@@ -39,7 +39,7 @@ class BinaryArbDetector(BaseDetector):
         if not yes_book.asks or not no_book.asks:
             return None
 
-        return detect_binary_arbitrage(
+        opp = detect_binary_arbitrage(
             market=market,
             yes_orderbook={"asks": yes_book.asks, "bids": yes_book.bids},
             no_orderbook={"asks": no_book.asks, "bids": no_book.bids},
@@ -48,6 +48,17 @@ class BinaryArbDetector(BaseDetector):
             buffer_percent=self._get_buffer(yes_book.asks, no_book.asks),
             min_liquidity_usd=self.min_liquidity_usd,
         )
+
+        # Attach data freshness (per-leg) so we can display it in Discord.
+        if opp is not None:
+            now = datetime.now(timezone.utc).timestamp()
+            try:
+                opp.yes_book_age_s = float(max(0.0, now - float(yes_book.last_update or 0.0)))
+                opp.no_book_age_s = float(max(0.0, now - float(no_book.last_update or 0.0)))
+            except Exception:
+                pass
+
+        return opp
 
     def _get_buffer(
         self,
