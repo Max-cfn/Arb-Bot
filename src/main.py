@@ -537,9 +537,22 @@ async def main() -> None:
     # --- Launch tasks ---
     logger.info("Starting bot (watching %d assets)...", len(asset_ids))
 
+    async def _send_running_health_once() -> None:
+        # Give WS a moment to connect and start receiving books.
+        await asyncio.sleep(20)
+        try:
+            stats = ob_manager.get_stats()
+            await discord.send_health("Running", {
+                "Markets": stats.get("total_markets"),
+                "Assets tracked": stats.get("tracked_assets"),
+                "Stale books": stats.get("stale_books"),
+            })
+        except Exception as exc:
+            logger.error("One-shot health ping failed: %s", exc)
+
     tasks = [
         asyncio.create_task(ws_client.connect(), name="websocket"),
-        # health task disabled (was sending HEALTH webhook every 5 min)
+        asyncio.create_task(_send_running_health_once(), name="health_once"),
         asyncio.create_task(
             periodic_ops_debug(discord, ob_manager, start_time),
             name="ops_debug",
