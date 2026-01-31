@@ -456,6 +456,29 @@ async def main() -> None:
             except Exception:
                 continue
 
+            # Enrich opportunity with fee diagnostics (fast: cached; only called on actual opps)
+            try:
+                from src.scanner.fee_rate import get_fee_rate_bps
+
+                bps_yes = await get_fee_rate_bps(opp.yes_token_id)
+                bps_no = await get_fee_rate_bps(opp.no_token_id)
+                opp.fee_rate_bps_yes = int(bps_yes)
+                opp.fee_rate_bps_no = int(bps_no)
+
+                # Effective taker fee rate is price-dependent; docs show curve peaks ~1.56% at p=0.50.
+                # We scale by (bps/1000) so fee_rate_bps=1000 matches the published table.
+                def _fee_rate_percent(p: float, bps: int) -> float:
+                    if bps <= 0:
+                        return 0.0
+                    p = max(0.0, min(1.0, float(p)))
+                    curve = 0.25 * (p * (1.0 - p)) ** 2
+                    return 100.0 * curve * (float(bps) / 1000.0)
+
+                opp.taker_fee_rate_percent_yes = _fee_rate_percent(opp.yes_ask_vwap, opp.fee_rate_bps_yes)
+                opp.taker_fee_rate_percent_no = _fee_rate_percent(opp.no_ask_vwap, opp.fee_rate_bps_no)
+            except Exception:
+                pass
+
             # Always send an opportunity alert
             await discord.send_opportunity(opp)
             await db.log_opportunity(opp)

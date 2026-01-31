@@ -9,11 +9,15 @@ from zoneinfo import ZoneInfo
 from src.detector.base import ArbitrageOpportunity
 
 EMBED_COLORS = {
-    "success": 0x00FF00,
-    "warning": 0xFFAA00,
-    "error": 0xFF0000,
-    "info": 0x0099FF,
-    "opportunity": 0xFFD700,
+    "success": 0x00FF00,       # Green
+    "warning": 0xFFAA00,       # Orange
+    "error": 0xFF0000,         # Red
+    "info": 0x0099FF,          # Blue
+    "opportunity": 0xFFD700,   # Gold
+    "execution_sub": 0x3498DB, # Blue (Submitted)
+    "execution_fill": 0x2ECC71,# Green (Filled)
+    "execution_fail": 0xE74C3C,# Red (Failed)
+    "execution_payout": 0x9B59B6, # Purple (Payout)
 }
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
@@ -102,6 +106,22 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
                         "inline": True,
                     },
                     {
+                        "name": "Fees (taker est.)",
+                        "value": (
+                            f"YES: {getattr(opp, 'taker_fee_rate_percent_yes', 0.0):.2f}% (bps={getattr(opp, 'fee_rate_bps_yes', 0)})\n"
+                            f"NO:  {getattr(opp, 'taker_fee_rate_percent_no', 0.0):.2f}% (bps={getattr(opp, 'fee_rate_bps_no', 0)})"
+                        ),
+                        "inline": True,
+                    },
+                    {
+                        "name": "Data freshness",
+                        "value": (
+                            f"YES_age={getattr(opp, 'yes_book_age_s', 0.0):.1f}s\n"
+                            f"NO_age={getattr(opp, 'no_book_age_s', 0.0):.1f}s"
+                        ),
+                        "inline": True,
+                    },
+                    {
                         "name": "Plan (1 YES + 1 NO)",
                         "value": (
                             f"YES ask: ${opp.yes_best_ask:.4f}\n"
@@ -171,37 +191,118 @@ def format_execution_embed(
     run_id: str = "",
     status: str = "PLANNED",
 ) -> dict[str, Any]:
-    """Format a DRY-RUN execution message.
-
-    status examples: PLANNED, SUBMITTED, WAITING, CANCELLED, UNWIND
+    """Format a Detailed Execution Message.
+    
+    Status Types:
+    - PLANNED/SUBMITTED: Order placement details.
+    - FILLED/SUCCESS: Success confirmation.
+    - FAILED/CANCELLED: Failure/Cancellation details.
+    - PAYOUT: Payout received (future use).
     """
+    
     url = f"https://polymarket.com/market/{opp.slug}" if getattr(opp, "slug", "") else ""
+    
+    # Defaults
+    color = EMBED_COLORS["info"]
+    title_prefix = "ℹ️ Execution Update"
+    
+    s_upper = status.upper()
+    
+    if s_upper in ("SUBMITTED", "PLACED", "SENDING"):
+        color = EMBED_COLORS["execution_sub"]
+        title_prefix = "🛒 Order Placed"
+    elif s_upper in ("FILLED", "SUCCESS", "COMPLETED"):
+        color = EMBED_COLORS["execution_fill"]
+        title_prefix = "✅ Order Filled"
+    elif s_upper in ("FAILED", "CANCELLED", "REJECTED", "ERROR"):
+        color = EMBED_COLORS["execution_fail"]
+        title_prefix = "❌ Order Failed/Cancelled"
+    elif s_upper in ("PAYOUT", "CLAIMED"):
+        color = EMBED_COLORS["execution_payout"]
+        title_prefix = "💰 Payout Received"
+    elif s_upper == "WAITING":
+        color = EMBED_COLORS["warning"]
+        title_prefix = "⏳ Waiting for Fill"
 
-    header = f"DRY-RUN execution | {status}"
-    if run_id:
-        header += f" | run={run_id}"
+    title = f"{title_prefix} | {s_upper}"
+    
+    # Common Fields
+    fields = []
+    
+    # 1. Market Info
+    fields.append({
+        "name": "Market",
+        "value": f"[{opp.market_question}]({url})\nID: `{str(opp.market_id)[:16]}...`",
+        "inline": False
+    })
+    
+    # 2. Strategy / Edge
+    fields.append({
+        "name": "Strategy",
+        "value": f"Net Edge: **{opp.net_edge_percent:.2f}%**\nEst. Profit: ${opp.one_share_net_profit:.4f}/share",
+        "inline": True
+    })
+    
+    # 3. Order Details (What are we buying?)
+    # Assuming standard arb: Buy YES + Buy NO
+    fields.append({
+        "name": "Orders (Limit)",
+        "value": (
+            f"🟢 **BUY YES** @ ${opp.yes_best_ask:.4f}\n"
+            f"🔴 **BUY NO**  @ ${opp.no_best_ask:.4f}\n"
+            f"Total Cost: ${opp.combined_best_asks:.4f}"
+        ),
+        "inline": True
+    })
 
-    desc_lines = [
-        header,
-        f"Market: {url}" if url else "Market: (no slug)",
-        f"Resolves: {_format_resolve_time_paris(getattr(opp, 'end_date', ''))} | left: {_format_time_left(getattr(opp, 'end_date', ''))}",
-        "",
-        "Orders (intended):",
-        f"- BUY 1 YES @ {opp.yes_best_ask:.4f}",
-        f"- BUY 1 NO  @ {opp.no_best_ask:.4f}",
-        f"- Combined best asks: {opp.combined_best_asks:.4f}",
-        f"- 1-share net: {opp.one_share_net_edge_percent:.2f}% (profit {opp.one_share_net_profit:.4f})",
-    ]
-    if note:
-        desc_lines.append("")
-        desc_lines.append(note)
+    # 4. Status Specifics
+    if s_upper in ("SUBMITTED", "PLACED"):
+        fields.append({
+            "name": "Status",
+            "value": "Orders submitted to CLOB. Waiting for confirmation...",
+            "inline": False
+        })
+    elif s_upper == "FILLED":
+        fields.append({
+            "name": "Execution Result",
+            "value": "✅ **Both legs filled.** Position secured.",
+            "inline": False
+        })
+    elif s_upper in ("FAILED", "CANCELLED"):
+        fields.append({
+            "name": "Failure Reason",
+            "value": note if note else "Unknown error or timeout.",
+            "inline": False
+        })
+    elif s_upper == "PAYOUT":
+        fields.append({
+            "name": "Payout Details",
+            "value": note if note else "Funds claimed successfully.",
+            "inline": False
+        })
+
+    # 5. Technical / Debug Info
+    footer_text = f"Run ID: {run_id}" if run_id else f"Market: {str(opp.market_id)[:10]}"
+    if note and s_upper not in ("FAILED", "CANCELLED", "PAYOUT"):
+        # If note wasn't used in main body, add it to footer or description
+        pass # simplified for cleaner look, or could add field
+
+    # Extra note field if provided and not already consumed
+    if note and s_upper not in ("FAILED", "CANCELLED", "PAYOUT"):
+         fields.append({
+            "name": "Note",
+            "value": note,
+            "inline": False
+        })
 
     return {
         "embeds": [
             {
-                "title": f"Execution (dry-run) | net {opp.net_edge_percent:.1f}%",
-                "description": "\n".join(desc_lines)[:4000],
-                "color": EMBED_COLORS["info"],
+                "title": title,
+                "url": url if url else None,
+                "color": color,
+                "fields": fields,
+                "footer": {"text": footer_text},
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         ]

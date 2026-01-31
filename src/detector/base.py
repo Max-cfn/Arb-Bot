@@ -55,6 +55,16 @@ class ArbitrageOpportunity:
     # Verdict
     verdict: str  # "ACTIONABLE" | "MARGINAL" | "SKIP"
 
+    # Data freshness (seconds since last WS update for each leg, set at runtime)
+    yes_book_age_s: float = 0.0
+    no_book_age_s: float = 0.0
+
+    # Fees (diagnostics; set/enriched at runtime)
+    fee_rate_bps_yes: int = 0
+    fee_rate_bps_no: int = 0
+    taker_fee_rate_percent_yes: float = 0.0
+    taker_fee_rate_percent_no: float = 0.0
+
 
 class BaseDetector(ABC):
     """Interface for arbitrage detectors."""
