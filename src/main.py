@@ -463,10 +463,37 @@ async def main() -> None:
                 now_ts = time.time()
                 if now_ts - last > 60:
                     on_orderbook_update._exec_last[opp.market_id] = now_ts  # type: ignore[attr-defined]
+                    # Simulated state machine (dry-run): SUBMITTED -> WAITING -> CANCELLED
+                    run_id = f"{opp.market_id}-{int(now_ts)}"
                     await discord.send_execution(
                         opp,
                         note="Strategy: strict limit, send both ASAP; cancel fast; if single-fill => unwind immediately (dry-run).",
+                        run_id=run_id,
+                        status="SUBMITTED",
                     )
+
+                    async def _simulate_states() -> None:
+                        # WAITING
+                        await asyncio.sleep(1.5)
+                        await discord.send_execution(
+                            opp,
+                            note="No fill within timeout => would cancel both orders.",
+                            run_id=run_id,
+                            status="WAITING",
+                        )
+                        # CANCELLED
+                        await asyncio.sleep(0.2)
+                        await discord.send_execution(
+                            opp,
+                            note=(
+                                "CANCELLED (simulated). If only one leg had filled, "
+                                "we would immediately unwind that leg (market/aggro limit)."
+                            ),
+                            run_id=run_id,
+                            status="CANCELLED",
+                        )
+
+                    asyncio.create_task(_simulate_states(), name=f"dryrun-{opp.market_id}")
             except Exception:
                 pass
 

@@ -164,12 +164,25 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
     }
 
 
-def format_execution_embed(opp: ArbitrageOpportunity, note: str = "") -> dict[str, Any]:
-    """Format a DRY-RUN execution plan message."""
+def format_execution_embed(
+    opp: ArbitrageOpportunity,
+    note: str = "",
+    *,
+    run_id: str = "",
+    status: str = "PLANNED",
+) -> dict[str, Any]:
+    """Format a DRY-RUN execution message.
+
+    status examples: PLANNED, SUBMITTED, WAITING, CANCELLED, UNWIND
+    """
     url = f"https://polymarket.com/market/{opp.slug}" if getattr(opp, "slug", "") else ""
 
+    header = f"DRY-RUN execution | {status}"
+    if run_id:
+        header += f" | run={run_id}"
+
     desc_lines = [
-        "DRY-RUN: planned execution (no orders sent)",
+        header,
         f"Market: {url}" if url else "Market: (no slug)",
         f"Resolves: {_format_resolve_time_paris(getattr(opp, 'end_date', ''))} | left: {_format_time_left(getattr(opp, 'end_date', ''))}",
         "",
@@ -186,7 +199,7 @@ def format_execution_embed(opp: ArbitrageOpportunity, note: str = "") -> dict[st
     return {
         "embeds": [
             {
-                "title": f"Execution plan (dry-run) | net {opp.net_edge_percent:.1f}%",
+                "title": f"Execution (dry-run) | net {opp.net_edge_percent:.1f}%",
                 "description": "\n".join(desc_lines)[:4000],
                 "color": EMBED_COLORS["info"],
                 "timestamp": datetime.now(timezone.utc).isoformat(),

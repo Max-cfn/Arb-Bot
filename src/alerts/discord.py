@@ -81,9 +81,16 @@ class DiscordClient:
         )
         return await self._send("opportunities", payload)
 
-    async def send_execution(self, opp: ArbitrageOpportunity, note: str = "") -> bool:
+    async def send_execution(
+        self,
+        opp: ArbitrageOpportunity,
+        note: str = "",
+        *,
+        run_id: str = "",
+        status: str = "PLANNED",
+    ) -> bool:
         """Send a dry-run execution plan (or later real execution status)."""
-        payload = format_execution_embed(opp, note=note)
+        payload = format_execution_embed(opp, note=note, run_id=run_id, status=status)
         # Prefer executions channel if configured; otherwise fall back to ops.
         ok = await self._send("executions", payload)
         if not ok:
