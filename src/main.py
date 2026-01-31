@@ -133,6 +133,10 @@ async def periodic_market_refresh(
                 logger.info("Refreshed markets: %d active (filtered from %d)", len(new_markets), len(pool))
         except Exception as exc:
             logger.error("Market refresh failed: %s", exc)
+            try:
+                await discord.send_ops(f"Market refresh failed: {exc}")
+            except Exception:
+                pass
 
 
 async def daily_summary_task(
