@@ -255,15 +255,15 @@ async def periodic_ops_debug(
         await asyncio.sleep(DEBUG_OPS_INTERVAL)
         try:
             stats = ob_manager.get_stats()
-            recent = ob_manager.get_recent_assets(10)
-
             now = time.time()
             uptime_s = int(now - start_time)
             h, rem = divmod(uptime_s, 3600)
             m, s = divmod(rem, 60)
 
             newest_age = int(now - stats.get("newest_update", 0.0)) if stats.get("newest_update") else None
+            oldest_age = int(now - stats.get("oldest_update", 0.0)) if stats.get("oldest_update") else None
 
+            # Keep OPS readable: summary only (no recent asset list / raw edges).
             lines = []
             lines.append(f"WS/OB debug | uptime={h:02d}h{m:02d}m{s:02d}s")
             lines.append(
@@ -271,36 +271,8 @@ async def periodic_ops_debug(
             )
             if newest_age is not None:
                 lines.append(f"newest_book_age={newest_age}s")
-            if not recent:
-                lines.append("recent_assets: (none yet)")
-            else:
-                lines.append("recent_assets (asset_id | age_s | best_bid | best_ask):")
-                for asset_id, last_upd, best_bid, best_ask in recent:
-                    age = int(now - last_upd)
-                    lines.append(f"- {asset_id} | {age}s | {best_bid} | {best_ask}")
-
-                # Also try to compute a few "raw" (best-ask-based) edges at market level
-                # even if they don't pass thresholds.
-                lines.append("raw_edges (market_id | combined_best_asks | gross_edge | question):")
-                seen = 0
-                for asset_id, _, _, _ in recent:
-                    mkts = ob_manager.get_markets_by_asset(asset_id)
-                    if not mkts:
-                        continue
-                    mkt = mkts[0]
-                    yes_book, no_book = ob_manager.get_market_books(mkt)
-                    yes_ask = yes_book.asks[0][0] if yes_book and yes_book.asks else None
-                    no_ask = no_book.asks[0][0] if no_book and no_book.asks else None
-                    if yes_ask is None or no_ask is None:
-                        continue
-                    combined = yes_ask + no_ask
-                    gross_edge = 1.0 - combined
-                    lines.append(
-                        f"- {mkt.get('id')} | {combined:.4f} | {gross_edge:.4f} | {mkt.get('question','')[:90]}"
-                    )
-                    seen += 1
-                    if seen >= 5:
-                        break
+            if oldest_age is not None:
+                lines.append(f"oldest_book_age={oldest_age}s")
 
             msg = "\n".join(lines)
             await discord.send_ops(msg)
@@ -434,16 +406,19 @@ async def main() -> None:
                     except Exception:
                         pass
 
-                msg = (
-                    "WS sample update\n"
-                    f"asset_id={asset_id}\n"
-                    f"market_id={market.get('id') if market else ''}\n"
-                    f"question={market.get('question') if market else ''}\n"
-                    f"best_bid={best_bid}\n"
-                    f"best_ask={best_ask}"
-                    f"{extra}"
-                )
-                await discord.send_ops(msg)
+                # Sample updates were useful during initial debugging, but are too noisy for ops.
+                # Keeping this block disabled by default.
+                # msg = (
+                #     "WS sample update\n"
+                #     f"asset_id={asset_id}\n"
+                #     f"market_id={market.get('id') if market else ''}\n"
+                #     f"question={market.get('question') if market else ''}\n"
+                #     f"best_bid={best_bid}\n"
+                #     f"best_ask={best_ask}"
+                #     f"{extra}"
+                # )
+                # await discord.send_ops(msg)
+                pass
             except Exception as exc:
                 logger.error("Failed to send WS sample to OPS: %s", exc)
 
