@@ -18,6 +18,8 @@ from src.scanner.market_fetcher import extract_all_token_ids, fetch_active_marke
 from src.scanner.orderbook_manager import OrderbookManager
 from src.scanner.websocket_client import PolymarketWebSocket
 from src.storage.db import Database
+from src.execution.clob_executor import PolymarketClobExecutor
+from src.execution.types import ExecutionMetrics
 from src.utils.geoblock import check_geoblock, get_public_ip
 from src.utils.logger import logger
 
@@ -40,6 +42,9 @@ CONTROL_FILE = Path(os.getenv("POLY_CONTROL_FILE", "data/control.json"))
 
 # One-shot execution (safety): automatically disable trading after first execution attempt
 ONE_SHOT_TRADE = os.getenv("ONE_SHOT_TRADE", "0").strip() in {"1", "true", "True", "yes", "YES"}
+
+# Execution mode: dry-run (default) or real
+EXECUTION_MODE = os.getenv("EXECUTION_MODE", "dryrun").strip().lower()
 
 
 
@@ -540,6 +545,25 @@ async def main() -> None:
                             discord.send_ops(f"ONE_SHOT_TRADE: disabled trading after first execution attempt (market {opp.market_id})."),
                             name="ops-oneshot",
                         )
+
+                    if EXECUTION_MODE == "real":
+                        metrics = ExecutionMetrics(t_detect_ns=t_detect_ns, t_submit_ns=t_submit_ns)
+                        # NOTE: do NOT block on Discord here; real execution handles its own acks/fills.
+                        res = await executor.execute_two_leg(opp, run_id=run_id, metrics=metrics)
+                        # Minimal reporting (async)
+                        asyncio.create_task(
+                            discord.send_execution(
+                                opp,
+                                note=(
+                                    f"REAL_EXEC status={res.status}\n"
+                                    + (f"reason={res.reason}\n" if res.reason else "")
+                                ),
+                                run_id=run_id,
+                                status=res.status if res.status in {"SUBMITTED","WAITING","FILLED","CANCELLED","FAILED"} else "FAILED",
+                            ),
+                            name=f"exec-real-report-{opp.market_id}",
+                        )
+                        return
 
                     # Simulated state machine (dry-run for now): SUBMITTED -> WAITING -> CANCELLED
                     run_id = f"{opp.market_id}-{int(now_ts)}"
