@@ -38,6 +38,10 @@ WS_PROBE_MAX_MSGS = 4
 # Trading control (killswitch)
 CONTROL_FILE = Path(os.getenv("POLY_CONTROL_FILE", "data/control.json"))
 
+# One-shot execution (safety): automatically disable trading after first execution attempt
+ONE_SHOT_TRADE = os.getenv("ONE_SHOT_TRADE", "0").strip() in {"1", "true", "True", "yes", "YES"}
+
+
 
 def is_trading_enabled() -> bool:
     """Return whether trading/execution is enabled.
@@ -64,6 +68,19 @@ def is_trading_enabled() -> bool:
         return True
 
     return True
+
+
+def set_trading_enabled(enabled: bool) -> None:
+    """Persist trading enabled flag to CONTROL_FILE.
+
+    This is used for one-shot mode and emergency shutdown.
+    """
+    try:
+        CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONTROL_FILE.write_text(json.dumps({"trading_enabled": bool(enabled)}, indent=2) + "\n")
+    except Exception as exc:
+        logger.error("Failed to write control file %s: %s", CONTROL_FILE, exc)
+
 
 
 async def periodic_health_check(
@@ -98,15 +115,16 @@ def select_markets(
     """Select a market universe.
 
     Aggressive OR filter: keep markets with liquidity>=min_liquidity_usd OR volume>=min_volume_usd.
-    Then sort by (liquidity + volume) descending and take top max_markets.
+    Then sort by volume descending (priority to activity) and take top max_markets.
     """
     filtered = [
         m for m in markets
         if (float(m.get("liquidity", 0) or 0) >= min_liquidity_usd)
         or (float(m.get("volume", 0) or 0) >= min_volume_usd)
     ]
+    # Priority to 24h volume (activity) over static liquidity
     filtered.sort(
-        key=lambda m: float(m.get("liquidity", 0) or 0) + float(m.get("volume", 0) or 0),
+        key=lambda m: float(m.get("volume", 0) or 0),
         reverse=True,
     )
     return filtered[:max_markets]
@@ -431,6 +449,9 @@ async def main() -> None:
             if not opp:
                 continue
 
+            # Latency baseline: stamp monotonic time at detection (ns)
+            opp._t_detect_ns = time.monotonic_ns()  # type: ignore[attr-defined]
+
             # USER REQUEST: tiered edge thresholds by time-to-resolution
             # - < 15 min:  net > 2.0%
             # - 15 min–4h: net > 3.5%
@@ -482,16 +503,14 @@ async def main() -> None:
                 opp.taker_fee_rate_percent_no = _fee_rate_percent(opp.no_ask_vwap, opp.fee_rate_bps_no)
             except Exception:
                 pass
+            # Always emit opportunity alert + DB log, but NEVER block the trading path on Discord/IO
+            asyncio.create_task(discord.send_opportunity(opp), name=f"alert-opp-{opp.market_id}")
+            asyncio.create_task(db.log_opportunity(opp), name=f"db-opp-{opp.market_id}")
 
-            # Always send an opportunity alert
-            await discord.send_opportunity(opp)
-            await db.log_opportunity(opp)
-
-            # Dry-run execution plan: show what we'd do (no orders placed).
-            # Cooldown per market to avoid spam.
+            # --- AUTOMATION: ATTEMPT EXECUTION IMMEDIATELY ---
             # If killswitch is OFF, we keep scanning/alerting but do not emit execution/trading actions.
             if not is_trading_enabled():
-                return
+                continue
 
             try:
                 if not hasattr(on_orderbook_update, "_exec_last"):  # type: ignore[attr-defined]
@@ -500,39 +519,68 @@ async def main() -> None:
                 now_ts = time.time()
                 if now_ts - last > 60:
                     on_orderbook_update._exec_last[opp.market_id] = now_ts  # type: ignore[attr-defined]
-                    # Simulated state machine (dry-run): SUBMITTED -> WAITING -> CANCELLED
+                    t_detect_ns = getattr(opp, "_t_detect_ns", None)
+                    t_send_ns = time.monotonic_ns()
+                    detect_to_send_ms = None
+                    if isinstance(t_detect_ns, int):
+                        detect_to_send_ms = (t_send_ns - t_detect_ns) / 1e6
+
+                    logger.info(
+                        "EXEC_DECISION market=%s edge=%.2f%% detect_to_send_ms=%s",
+                        opp.market_id,
+                        opp.net_edge_percent,
+                        f"{detect_to_send_ms:.3f}" if detect_to_send_ms is not None else "n/a",
+                    )
+
+                    # One-shot safety: as soon as we decide to attempt an execution, flip killswitch OFF.
+                    if ONE_SHOT_TRADE:
+                        set_trading_enabled(False)
+                        asyncio.create_task(
+                            discord.send_ops(f"ONE_SHOT_TRADE: disabled trading after first execution attempt (market {opp.market_id})."),
+                            name="ops-oneshot",
+                        )
+
+                    # Simulated state machine (dry-run for now): SUBMITTED -> WAITING -> CANCELLED
                     run_id = f"{opp.market_id}-{int(now_ts)}"
-                    await discord.send_execution(
-                        opp,
-                        note="Strategy: strict limit, send both ASAP; cancel fast; if single-fill => unwind immediately (dry-run).",
-                        run_id=run_id,
-                        status="SUBMITTED",
+                    note0 = "Strategy: strict limit, send both ASAP; cancel fast; if single-fill => unwind immediately (dry-run)."
+                    if detect_to_send_ms is not None:
+                        note0 += f"\nLatency: detect→submit {detect_to_send_ms:.3f}ms"
+
+                    asyncio.create_task(
+                        discord.send_execution(opp, note=note0, run_id=run_id, status="SUBMITTED"),
+                        name=f"exec-sub-{opp.market_id}",
                     )
 
                     async def _simulate_states() -> None:
                         # WAITING
                         await asyncio.sleep(1.5)
-                        await discord.send_execution(
-                            opp,
-                            note="No fill within timeout => would cancel both orders.",
-                            run_id=run_id,
-                            status="WAITING",
+                        asyncio.create_task(
+                            discord.send_execution(
+                                opp,
+                                note="No fill within timeout => would cancel both orders.",
+                                run_id=run_id,
+                                status="WAITING",
+                            ),
+                            name=f"exec-wait-{opp.market_id}",
                         )
                         # CANCELLED
                         await asyncio.sleep(0.2)
-                        await discord.send_execution(
-                            opp,
-                            note=(
-                                "CANCELLED (simulated). If only one leg had filled, "
-                                "we would immediately unwind that leg (market/aggro limit)."
+                        asyncio.create_task(
+                            discord.send_execution(
+                                opp,
+                                note=(
+                                    "CANCELLED (simulated). If only one leg had filled, "
+                                    "we would immediately unwind that leg (market/aggro limit)."
+                                ),
+                                run_id=run_id,
+                                status="CANCELLED",
                             ),
-                            run_id=run_id,
-                            status="CANCELLED",
+                            name=f"exec-cancel-{opp.market_id}",
                         )
 
                     asyncio.create_task(_simulate_states(), name=f"dryrun-{opp.market_id}")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.error("Execution attempt failed: %s", exc)
 
     async def on_ws_error(exc: Exception) -> None:
         await discord.send_ops(f"WebSocket error: {exc}")
