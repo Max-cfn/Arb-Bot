@@ -220,6 +220,68 @@ async def periodic_db_purge(db: Database) -> None:
             logger.error("DB purge failed: %s", exc)
 
 
+async def periodic_6h_summary(
+    discord: DiscordClient,
+    db: Database,
+) -> None:
+    """Send a rolling 24h stats ping every 6 hours, including delta vs last ping."""
+    from pathlib import Path
+
+    state_path = Path(os.getenv("ROLLING_STATS_STATE", "data/rolling_stats.json"))
+
+    def _load_state() -> dict:
+        try:
+            import json
+            return json.loads(state_path.read_text())
+        except Exception:
+            return {"last_24h_total": None, "last_24h_actionable": None, "updated_at": None}
+
+    def _save_state(st: dict) -> None:
+        try:
+            import json
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(json.dumps(st, indent=2) + "\n")
+        except Exception:
+            pass
+
+    while True:
+        await asyncio.sleep(6 * 3600)
+        try:
+            stats_24h = await db.get_stats_last_24h()
+            st = _load_state()
+
+            last_total = st.get("last_24h_total")
+            cur_total = stats_24h.get("total", 0)
+
+            delta_pct = None
+            if isinstance(last_total, (int, float)) and last_total and cur_total is not None:
+                try:
+                    delta_pct = ((cur_total - last_total) / float(last_total)) * 100.0
+                except Exception:
+                    delta_pct = None
+
+            msg = {
+                "Window": "Rolling 24h (6h ping)",
+                "Last 24h total": cur_total,
+                "Last 24h actionable": stats_24h.get("actionable", 0),
+                "Avg edge %": stats_24h.get("avg_edge", 0),
+                "Max edge %": stats_24h.get("max_edge", 0),
+            }
+            if delta_pct is None:
+                msg["Δ total vs prev"] = "n/a (first ping)"
+            else:
+                msg["Δ total vs prev"] = f"{delta_pct:+.1f}%"
+
+            await discord.send_daily_summary(msg)
+
+            st["last_24h_total"] = cur_total
+            st["last_24h_actionable"] = stats_24h.get("actionable", 0)
+            st["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _save_state(st)
+        except Exception as exc:
+            logger.error("6h rolling summary failed: %s", exc)
+
+
 async def ws_probe_subscriptions(discord: DiscordClient, asset_ids: list[str]) -> None:
     """Try several subscribe payload variants and report what the WS returns.
 
@@ -691,6 +753,7 @@ async def main() -> None:
     asyncio.create_task(_send_running_health_once(), name="health_once")
 
     tasks = [
+        asyncio.create_task(periodic_6h_summary(discord, db), name="summary_6h"),
         asyncio.create_task(ws_client.connect(), name="websocket"),
         asyncio.create_task(
             periodic_ops_debug(discord, ob_manager, start_time),
