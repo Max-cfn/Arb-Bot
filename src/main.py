@@ -521,6 +521,7 @@ async def main() -> None:
                     on_orderbook_update._exec_last[opp.market_id] = now_ts  # type: ignore[attr-defined]
                     t_detect_ns = getattr(opp, "_t_detect_ns", None)
                     t_send_ns = time.monotonic_ns()
+                    t_submit_ns = t_send_ns  # alias for clarity
                     detect_to_send_ms = None
                     if isinstance(t_detect_ns, int):
                         detect_to_send_ms = (t_send_ns - t_detect_ns) / 1e6
@@ -554,10 +555,12 @@ async def main() -> None:
                     async def _simulate_states() -> None:
                         # WAITING
                         await asyncio.sleep(1.5)
+                        t_wait_ns = time.monotonic_ns()
+                        submit_to_wait_ms = (t_wait_ns - t_submit_ns) / 1e6
                         asyncio.create_task(
                             discord.send_execution(
                                 opp,
-                                note="No fill within timeout => would cancel both orders.",
+                                note=f"No fill within timeout => would cancel both orders.\nLatency: submit→waiting {submit_to_wait_ms:.3f}ms",
                                 run_id=run_id,
                                 status="WAITING",
                             ),
@@ -565,12 +568,15 @@ async def main() -> None:
                         )
                         # CANCELLED
                         await asyncio.sleep(0.2)
+                        t_cancel_ns = time.monotonic_ns()
+                        submit_to_cancel_ms = (t_cancel_ns - t_submit_ns) / 1e6
                         asyncio.create_task(
                             discord.send_execution(
                                 opp,
                                 note=(
                                     "CANCELLED (simulated). If only one leg had filled, "
                                     "we would immediately unwind that leg (market/aggro limit)."
+                                    f"\nLatency: submit→cancel {submit_to_cancel_ms:.3f}ms"
                                 ),
                                 run_id=run_id,
                                 status="CANCELLED",
