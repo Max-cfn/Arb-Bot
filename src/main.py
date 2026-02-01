@@ -9,6 +9,7 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from src.alerts.discord import DiscordClient
@@ -167,24 +168,44 @@ async def daily_summary_task(
     db: Database,
     start_time: float,
 ) -> None:
-    """Send a daily summary at DAILY_SUMMARY_HOUR UTC."""
+    """Send a daily summary at midnight Europe/Paris.
+
+    Includes:
+    - rolling last-24h counts (to track trend)
+    - since-local-midnight counts (the day summary)
+    """
+    tz = ZoneInfo(os.getenv("DAILY_SUMMARY_TZ", "Europe/Paris"))
     while True:
-        now = datetime.now(timezone.utc)
-        # Calculate seconds until next target hour
-        target = now.replace(hour=DAILY_SUMMARY_HOUR, minute=0, second=0, microsecond=0)
-        if now >= target:
+        now_local = datetime.now(tz)
+        next_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        if now_local >= next_midnight:
             from datetime import timedelta
-            target += timedelta(days=1)
-        wait_seconds = (target - now).total_seconds()
-        await asyncio.sleep(wait_seconds)
+            next_midnight += timedelta(days=1)
+        await asyncio.sleep((next_midnight - now_local).total_seconds())
 
         try:
-            stats = await db.get_stats_last_24h()
+            stats_24h = await db.get_stats_last_24h()
+
+            midnight_local = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+            midnight_utc = midnight_local.astimezone(timezone.utc)
+            stats_today = await db.get_stats_since(midnight_utc.isoformat())
+
             uptime_s = int(time.time() - start_time)
             hours, _ = divmod(uptime_s, 3600)
-            stats["Uptime (hours)"] = hours
-            await discord.send_daily_summary(stats)
-            logger.info("Daily summary sent: %s", stats)
+
+            summary = {
+                "Window": f"{tz.key} day summary",
+                "Today total": stats_today.get("total", 0),
+                "Today actionable": stats_today.get("actionable", 0),
+                "Today avg edge %": stats_today.get("avg_edge", 0),
+                "Today max edge %": stats_today.get("max_edge", 0),
+                "Last 24h total": stats_24h.get("total", 0),
+                "Last 24h actionable": stats_24h.get("actionable", 0),
+                "Uptime (hours)": hours,
+            }
+
+            await discord.send_daily_summary(summary)
+            logger.info("Daily summary sent: %s", summary)
         except Exception as exc:
             logger.error("Daily summary failed: %s", exc)
 

@@ -112,6 +112,34 @@ class Database:
             "actionable": row[3],
         }
 
+
+    async def get_stats_since(self, cutoff_iso: str) -> dict:
+        """Return summary stats for opportunities with timestamp > cutoff_iso."""
+        if self._db is None:
+            return {}
+        cursor = await self._db.execute(
+            """
+            SELECT
+                COUNT(*) as total,
+                COALESCE(AVG(net_edge_percent), 0) as avg_edge,
+                COALESCE(MAX(net_edge_percent), 0) as max_edge,
+                SUM(CASE WHEN verdict = 'ACTIONABLE' THEN 1 ELSE 0 END) as actionable
+            FROM opportunities
+            WHERE timestamp > ?
+            """,
+            (cutoff_iso,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return {"total": 0, "avg_edge": 0, "max_edge": 0, "actionable": 0}
+        return {
+            "total": row[0],
+            "avg_edge": round(row[1], 2),
+            "max_edge": round(row[2], 2),
+            "actionable": row[3],
+        }
+
+
     async def purge_old(self, hours: int = 24) -> int:
         """Delete records older than *hours*. Returns rows deleted."""
         if self._db is None:
