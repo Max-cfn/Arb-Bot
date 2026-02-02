@@ -224,9 +224,21 @@ async def periodic_6h_summary(
     discord: DiscordClient,
     db: Database,
 ) -> None:
-    """Send a rolling 24h stats ping every 6 hours, including delta vs last ping."""
-    from pathlib import Path
+    """Send a rolling 24h stats ping on fixed 6h boundaries, incl. delta vs last ping.
 
+    Why:
+    - The old implementation used `sleep(6h)` which drifts with restarts and runtime delays.
+    - We want absolute times (e.g. 00:00/06:00/12:00/18:00 in the chosen TZ).
+
+    State:
+    - We persist the previous ping totals in `data/rolling_stats.json` so the next ping can
+      reference the previous one. If that file isn't writable (permissions), deltas will
+      always show "first ping".
+    """
+    from pathlib import Path
+    from datetime import timedelta
+
+    tz = ZoneInfo(os.getenv("ROLLING_STATS_TZ", os.getenv("DAILY_SUMMARY_TZ", "Europe/Paris")))
     state_path = Path(os.getenv("ROLLING_STATS_STATE", "data/rolling_stats.json"))
 
     def _load_state() -> dict:
@@ -241,11 +253,24 @@ async def periodic_6h_summary(
             import json
             state_path.parent.mkdir(parents=True, exist_ok=True)
             state_path.write_text(json.dumps(st, indent=2) + "\n")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to persist rolling stats state (%s): %s", state_path, exc)
+
+    def _next_boundary(now_local: datetime) -> datetime:
+        # Next boundary at hour in {0,6,12,18}
+        h = now_local.hour
+        next_h = ((h // 6) + 1) * 6
+        if next_h >= 24:
+            base = now_local.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        else:
+            base = now_local.replace(hour=next_h, minute=0, second=0, microsecond=0)
+        return base
 
     while True:
-        await asyncio.sleep(6 * 3600)
+        now_local = datetime.now(tz)
+        nxt = _next_boundary(now_local)
+        await asyncio.sleep(max(0.0, (nxt - now_local).total_seconds()))
+
         try:
             stats_24h = await db.get_stats_last_24h()
             st = _load_state()
@@ -261,14 +286,14 @@ async def periodic_6h_summary(
                     delta_pct = None
 
             msg = {
-                "Window": "Rolling 24h (6h ping)",
+                "Window": f"Rolling 24h (6h ping) | {tz.key} @ {datetime.now(tz).strftime('%H:%M')}",
                 "Last 24h total": cur_total,
                 "Last 24h actionable": stats_24h.get("actionable", 0),
                 "Avg edge %": stats_24h.get("avg_edge", 0),
                 "Max edge %": stats_24h.get("max_edge", 0),
             }
             if delta_pct is None:
-                msg["Δ total vs prev"] = "n/a (first ping)"
+                msg["Δ total vs prev"] = "n/a (first ping or state not writable)"
             else:
                 msg["Δ total vs prev"] = f"{delta_pct:+.1f}%"
 
