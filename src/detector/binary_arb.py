@@ -39,7 +39,21 @@ class BinaryArbDetector(BaseDetector):
         if not yes_book.asks or not no_book.asks:
             return None
 
-        return detect_binary_arbitrage(
+        # Freshness (per-leg)
+        now = datetime.now(timezone.utc).timestamp()
+        yes_age = float(max(0.0, now - float(yes_book.last_update or 0.0)))
+        no_age = float(max(0.0, now - float(no_book.last_update or 0.0)))
+
+        # Freshness gating (as discussed):
+        # - crypto 15-min markets: max 2s
+        # - other markets: max 8s
+        is_crypto = bool(market.get("is_crypto_15min", False))
+        max_age = 2.0 if is_crypto else 8.0
+        if yes_age > max_age or no_age > max_age:
+            # Too stale to trust the edge; skip alerting.
+            return None
+
+        opp = detect_binary_arbitrage(
             market=market,
             yes_orderbook={"asks": yes_book.asks, "bids": yes_book.bids},
             no_orderbook={"asks": no_book.asks, "bids": no_book.bids},
@@ -48,6 +62,13 @@ class BinaryArbDetector(BaseDetector):
             buffer_percent=self._get_buffer(yes_book.asks, no_book.asks),
             min_liquidity_usd=self.min_liquidity_usd,
         )
+
+        # Attach data freshness (per-leg) so we can display it in Discord.
+        if opp is not None:
+            opp.yes_book_age_s = yes_age
+            opp.no_book_age_s = no_age
+
+        return opp
 
     def _get_buffer(
         self,

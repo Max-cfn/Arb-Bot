@@ -48,9 +48,55 @@ class OrderbookManager:
                     self._asset_to_market[tid] = m
 
     def update(self, asset_id: str, book: dict) -> None:
-        """Update the orderbook for a given asset."""
-        bids = sorted(book.get("bids", []), key=lambda x: -x[0])[:MAX_LEVELS]
-        asks = sorted(book.get("asks", []), key=lambda x: x[0])[:MAX_LEVELS]
+        """Update the orderbook for a given asset.
+
+        Notes:
+        - Full `book` events provide depth.
+        - Some WS events only provide best_bid/best_ask; those are represented
+          as 1-level updates with size=0. We merge them into the existing book
+          instead of replacing full depth with a 1-level book.
+        """
+        bids_in = sorted(book.get("bids", []), key=lambda x: -x[0])
+        asks_in = sorted(book.get("asks", []), key=lambda x: x[0])
+
+        existing = self._books.get(asset_id)
+
+        # Heuristic: if incoming update is just 0-size top-of-book levels,
+        # merge it into existing rather than overwriting.
+        is_top_only = (
+            (len(bids_in) <= 1 and all(sz == 0.0 for _, sz in bids_in))
+            and (len(asks_in) <= 1 and all(sz == 0.0 for _, sz in asks_in))
+        )
+
+        if existing and is_top_only:
+            bids = existing.bids
+            asks = existing.asks
+
+            if bids_in:
+                bb = bids_in[0][0]
+                # keep old size if present at same price; else put 0
+                bids = [(bb, bids[0][1] if bids and bids[0][0] == bb else 0.0)] + [
+                    lvl for lvl in bids if lvl[0] != bb
+                ]
+            if asks_in:
+                ba = asks_in[0][0]
+                asks = [(ba, asks[0][1] if asks and asks[0][0] == ba else 0.0)] + [
+                    lvl for lvl in asks if lvl[0] != ba
+                ]
+
+            bids = sorted(bids, key=lambda x: -x[0])[:MAX_LEVELS]
+            asks = sorted(asks, key=lambda x: x[0])[:MAX_LEVELS]
+
+            self._books[asset_id] = Orderbook(
+                bids=bids,
+                asks=asks,
+                last_update=time.time(),
+            )
+            return
+
+        # Default: treat as full book replacement
+        bids = bids_in[:MAX_LEVELS]
+        asks = asks_in[:MAX_LEVELS]
 
         self._books[asset_id] = Orderbook(
             bids=bids,
