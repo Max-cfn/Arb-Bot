@@ -569,6 +569,24 @@ async def main() -> None:
             except Exception:
                 continue
 
+            # --- ALERT DEDUP (avoid spamming identical edges) ---
+            # Only re-alert a market if the net edge changes by >= 0.001 percentage points.
+            try:
+                if not hasattr(on_orderbook_update, "_alert_last"):  # type: ignore[attr-defined]
+                    on_orderbook_update._alert_last = {}  # type: ignore[attr-defined]
+
+                last_info = on_orderbook_update._alert_last.get(opp.market_id)  # type: ignore[attr-defined]
+                now_ts = time.time()
+                if last_info is not None:
+                    last_edge, _last_ts = last_info
+                    if abs(float(opp.net_edge_percent) - float(last_edge)) < 0.001:
+                        continue
+
+                on_orderbook_update._alert_last[opp.market_id] = (float(opp.net_edge_percent), now_ts)  # type: ignore[attr-defined]
+            except Exception:
+                # On any dedup bookkeeping issue, fall back to alerting.
+                pass
+
             # Enrich opportunity with fee diagnostics (fast: cached; only called on actual opps)
             try:
                 from src.scanner.fee_rate import get_fee_rate_bps
@@ -704,6 +722,9 @@ async def main() -> None:
 
     # --- WebSocket client ---
     asset_ids = extract_all_token_ids(markets)
+    # De-duplicate asset IDs to avoid subscribing multiple times to the same asset.
+    # Preserve order for stable chunking.
+    asset_ids = list(dict.fromkeys(asset_ids))
 
     if WS_PROBE_ON_START:
         # Fire-and-forget probe (bounded). Helps us discover correct subscribe format.
