@@ -116,8 +116,8 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
                     {
                         "name": "Data freshness",
                         "value": (
-                            f"YES_age={getattr(opp, 'yes_book_age_s', 0.0):.1f}s\n"
-                            f"NO_age={getattr(opp, 'no_book_age_s', 0.0):.1f}s"
+                            f"YES_age={getattr(opp, 'yes_book_age_s', 0.0):.3f}s\n"
+                            f"NO_age={getattr(opp, 'no_book_age_s', 0.0):.3f}s"
                         ),
                         "inline": True,
                     },

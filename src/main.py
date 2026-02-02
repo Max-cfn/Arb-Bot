@@ -9,6 +9,7 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from src.alerts.discord import DiscordClient
@@ -18,6 +19,8 @@ from src.scanner.market_fetcher import extract_all_token_ids, fetch_active_marke
 from src.scanner.orderbook_manager import OrderbookManager
 from src.scanner.websocket_client import PolymarketWebSocket
 from src.storage.db import Database
+from src.execution.clob_executor import PolymarketClobExecutor
+from src.execution.types import ExecutionMetrics
 from src.utils.geoblock import check_geoblock, get_public_ip
 from src.utils.logger import logger
 
@@ -37,6 +40,13 @@ WS_PROBE_MAX_MSGS = 4
 
 # Trading control (killswitch)
 CONTROL_FILE = Path(os.getenv("POLY_CONTROL_FILE", "data/control.json"))
+
+# One-shot execution (safety): automatically disable trading after first execution attempt
+ONE_SHOT_TRADE = os.getenv("ONE_SHOT_TRADE", "0").strip() in {"1", "true", "True", "yes", "YES"}
+
+# Execution mode: dry-run (default) or real
+EXECUTION_MODE = os.getenv("EXECUTION_MODE", "dryrun").strip().lower()
+
 
 
 def is_trading_enabled() -> bool:
@@ -64,6 +74,19 @@ def is_trading_enabled() -> bool:
         return True
 
     return True
+
+
+def set_trading_enabled(enabled: bool) -> None:
+    """Persist trading enabled flag to CONTROL_FILE.
+
+    This is used for one-shot mode and emergency shutdown.
+    """
+    try:
+        CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CONTROL_FILE.write_text(json.dumps({"trading_enabled": bool(enabled)}, indent=2) + "\n")
+    except Exception as exc:
+        logger.error("Failed to write control file %s: %s", CONTROL_FILE, exc)
+
 
 
 async def periodic_health_check(
@@ -98,15 +121,16 @@ def select_markets(
     """Select a market universe.
 
     Aggressive OR filter: keep markets with liquidity>=min_liquidity_usd OR volume>=min_volume_usd.
-    Then sort by (liquidity + volume) descending and take top max_markets.
+    Then sort by volume descending (priority to activity) and take top max_markets.
     """
     filtered = [
         m for m in markets
         if (float(m.get("liquidity", 0) or 0) >= min_liquidity_usd)
         or (float(m.get("volume", 0) or 0) >= min_volume_usd)
     ]
+    # Priority to 24h volume (activity) over static liquidity
     filtered.sort(
-        key=lambda m: float(m.get("liquidity", 0) or 0) + float(m.get("volume", 0) or 0),
+        key=lambda m: float(m.get("volume", 0) or 0),
         reverse=True,
     )
     return filtered[:max_markets]
@@ -144,24 +168,44 @@ async def daily_summary_task(
     db: Database,
     start_time: float,
 ) -> None:
-    """Send a daily summary at DAILY_SUMMARY_HOUR UTC."""
+    """Send a daily summary at midnight Europe/Paris.
+
+    Includes:
+    - rolling last-24h counts (to track trend)
+    - since-local-midnight counts (the day summary)
+    """
+    tz = ZoneInfo(os.getenv("DAILY_SUMMARY_TZ", "Europe/Paris"))
     while True:
-        now = datetime.now(timezone.utc)
-        # Calculate seconds until next target hour
-        target = now.replace(hour=DAILY_SUMMARY_HOUR, minute=0, second=0, microsecond=0)
-        if now >= target:
+        now_local = datetime.now(tz)
+        next_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        if now_local >= next_midnight:
             from datetime import timedelta
-            target += timedelta(days=1)
-        wait_seconds = (target - now).total_seconds()
-        await asyncio.sleep(wait_seconds)
+            next_midnight += timedelta(days=1)
+        await asyncio.sleep((next_midnight - now_local).total_seconds())
 
         try:
-            stats = await db.get_stats_last_24h()
+            stats_24h = await db.get_stats_last_24h()
+
+            midnight_local = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+            midnight_utc = midnight_local.astimezone(timezone.utc)
+            stats_today = await db.get_stats_since(midnight_utc.isoformat())
+
             uptime_s = int(time.time() - start_time)
             hours, _ = divmod(uptime_s, 3600)
-            stats["Uptime (hours)"] = hours
-            await discord.send_daily_summary(stats)
-            logger.info("Daily summary sent: %s", stats)
+
+            summary = {
+                "Window": f"{tz.key} day summary",
+                "Today total": stats_today.get("total", 0),
+                "Today actionable": stats_today.get("actionable", 0),
+                "Today avg edge %": stats_today.get("avg_edge", 0),
+                "Today max edge %": stats_today.get("max_edge", 0),
+                "Last 24h total": stats_24h.get("total", 0),
+                "Last 24h actionable": stats_24h.get("actionable", 0),
+                "Uptime (hours)": hours,
+            }
+
+            await discord.send_daily_summary(summary)
+            logger.info("Daily summary sent: %s", summary)
         except Exception as exc:
             logger.error("Daily summary failed: %s", exc)
 
@@ -174,6 +218,68 @@ async def periodic_db_purge(db: Database) -> None:
             await db.purge_old(hours=24)
         except Exception as exc:
             logger.error("DB purge failed: %s", exc)
+
+
+async def periodic_6h_summary(
+    discord: DiscordClient,
+    db: Database,
+) -> None:
+    """Send a rolling 24h stats ping every 6 hours, including delta vs last ping."""
+    from pathlib import Path
+
+    state_path = Path(os.getenv("ROLLING_STATS_STATE", "data/rolling_stats.json"))
+
+    def _load_state() -> dict:
+        try:
+            import json
+            return json.loads(state_path.read_text())
+        except Exception:
+            return {"last_24h_total": None, "last_24h_actionable": None, "updated_at": None}
+
+    def _save_state(st: dict) -> None:
+        try:
+            import json
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(json.dumps(st, indent=2) + "\n")
+        except Exception:
+            pass
+
+    while True:
+        await asyncio.sleep(6 * 3600)
+        try:
+            stats_24h = await db.get_stats_last_24h()
+            st = _load_state()
+
+            last_total = st.get("last_24h_total")
+            cur_total = stats_24h.get("total", 0)
+
+            delta_pct = None
+            if isinstance(last_total, (int, float)) and last_total and cur_total is not None:
+                try:
+                    delta_pct = ((cur_total - last_total) / float(last_total)) * 100.0
+                except Exception:
+                    delta_pct = None
+
+            msg = {
+                "Window": "Rolling 24h (6h ping)",
+                "Last 24h total": cur_total,
+                "Last 24h actionable": stats_24h.get("actionable", 0),
+                "Avg edge %": stats_24h.get("avg_edge", 0),
+                "Max edge %": stats_24h.get("max_edge", 0),
+            }
+            if delta_pct is None:
+                msg["Δ total vs prev"] = "n/a (first ping)"
+            else:
+                msg["Δ total vs prev"] = f"{delta_pct:+.1f}%"
+
+            await discord.send_daily_summary(msg)
+
+            st["last_24h_total"] = cur_total
+            st["last_24h_actionable"] = stats_24h.get("actionable", 0)
+            st["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _save_state(st)
+        except Exception as exc:
+            logger.error("6h rolling summary failed: %s", exc)
 
 
 async def ws_probe_subscriptions(discord: DiscordClient, asset_ids: list[str]) -> None:
@@ -431,6 +537,9 @@ async def main() -> None:
             if not opp:
                 continue
 
+            # Latency baseline: stamp monotonic time at detection (ns)
+            opp._t_detect_ns = time.monotonic_ns()  # type: ignore[attr-defined]
+
             # USER REQUEST: tiered edge thresholds by time-to-resolution
             # - < 15 min:  net > 2.0%
             # - 15 min–4h: net > 3.5%
@@ -482,16 +591,14 @@ async def main() -> None:
                 opp.taker_fee_rate_percent_no = _fee_rate_percent(opp.no_ask_vwap, opp.fee_rate_bps_no)
             except Exception:
                 pass
+            # Always emit opportunity alert + DB log, but NEVER block the trading path on Discord/IO
+            asyncio.create_task(discord.send_opportunity(opp), name=f"alert-opp-{opp.market_id}")
+            asyncio.create_task(db.log_opportunity(opp), name=f"db-opp-{opp.market_id}")
 
-            # Always send an opportunity alert
-            await discord.send_opportunity(opp)
-            await db.log_opportunity(opp)
-
-            # Dry-run execution plan: show what we'd do (no orders placed).
-            # Cooldown per market to avoid spam.
+            # --- AUTOMATION: ATTEMPT EXECUTION IMMEDIATELY ---
             # If killswitch is OFF, we keep scanning/alerting but do not emit execution/trading actions.
             if not is_trading_enabled():
-                return
+                continue
 
             try:
                 if not hasattr(on_orderbook_update, "_exec_last"):  # type: ignore[attr-defined]
@@ -500,39 +607,93 @@ async def main() -> None:
                 now_ts = time.time()
                 if now_ts - last > 60:
                     on_orderbook_update._exec_last[opp.market_id] = now_ts  # type: ignore[attr-defined]
-                    # Simulated state machine (dry-run): SUBMITTED -> WAITING -> CANCELLED
+                    t_detect_ns = getattr(opp, "_t_detect_ns", None)
+                    t_send_ns = time.monotonic_ns()
+                    t_submit_ns = t_send_ns  # alias for clarity
+                    detect_to_send_ms = None
+                    if isinstance(t_detect_ns, int):
+                        detect_to_send_ms = (t_send_ns - t_detect_ns) / 1e6
+
+                    logger.info(
+                        "EXEC_DECISION market=%s edge=%.2f%% detect_to_send_ms=%s",
+                        opp.market_id,
+                        opp.net_edge_percent,
+                        f"{detect_to_send_ms:.3f}" if detect_to_send_ms is not None else "n/a",
+                    )
+
+                    # One-shot safety: as soon as we decide to attempt an execution, flip killswitch OFF.
+                    if ONE_SHOT_TRADE:
+                        set_trading_enabled(False)
+                        asyncio.create_task(
+                            discord.send_ops(f"ONE_SHOT_TRADE: disabled trading after first execution attempt (market {opp.market_id})."),
+                            name="ops-oneshot",
+                        )
+
+                    if EXECUTION_MODE == "real":
+                        metrics = ExecutionMetrics(t_detect_ns=t_detect_ns, t_submit_ns=t_submit_ns)
+                        # NOTE: do NOT block on Discord here; real execution handles its own acks/fills.
+                        res = await executor.execute_two_leg(opp, run_id=run_id, metrics=metrics)
+                        # Minimal reporting (async)
+                        asyncio.create_task(
+                            discord.send_execution(
+                                opp,
+                                note=(
+                                    f"REAL_EXEC status={res.status}\n"
+                                    + (f"reason={res.reason}\n" if res.reason else "")
+                                ),
+                                run_id=run_id,
+                                status=res.status if res.status in {"SUBMITTED","WAITING","FILLED","CANCELLED","FAILED"} else "FAILED",
+                            ),
+                            name=f"exec-real-report-{opp.market_id}",
+                        )
+                        return
+
+                    # Simulated state machine (dry-run for now): SUBMITTED -> WAITING -> CANCELLED
                     run_id = f"{opp.market_id}-{int(now_ts)}"
-                    await discord.send_execution(
-                        opp,
-                        note="Strategy: strict limit, send both ASAP; cancel fast; if single-fill => unwind immediately (dry-run).",
-                        run_id=run_id,
-                        status="SUBMITTED",
+                    note0 = "Strategy: strict limit, send both ASAP; cancel fast; if single-fill => unwind immediately (dry-run)."
+                    if detect_to_send_ms is not None:
+                        note0 += f"\nLatency: detect→submit {detect_to_send_ms:.3f}ms"
+
+                    asyncio.create_task(
+                        discord.send_execution(opp, note=note0, run_id=run_id, status="SUBMITTED"),
+                        name=f"exec-sub-{opp.market_id}",
                     )
 
                     async def _simulate_states() -> None:
                         # WAITING
                         await asyncio.sleep(1.5)
-                        await discord.send_execution(
-                            opp,
-                            note="No fill within timeout => would cancel both orders.",
-                            run_id=run_id,
-                            status="WAITING",
+                        t_wait_ns = time.monotonic_ns()
+                        submit_to_wait_ms = (t_wait_ns - t_submit_ns) / 1e6
+                        asyncio.create_task(
+                            discord.send_execution(
+                                opp,
+                                note=f"No fill within timeout => would cancel both orders.\nLatency: submit→waiting {submit_to_wait_ms:.3f}ms",
+                                run_id=run_id,
+                                status="WAITING",
+                            ),
+                            name=f"exec-wait-{opp.market_id}",
                         )
                         # CANCELLED
                         await asyncio.sleep(0.2)
-                        await discord.send_execution(
-                            opp,
-                            note=(
-                                "CANCELLED (simulated). If only one leg had filled, "
-                                "we would immediately unwind that leg (market/aggro limit)."
+                        t_cancel_ns = time.monotonic_ns()
+                        submit_to_cancel_ms = (t_cancel_ns - t_submit_ns) / 1e6
+                        asyncio.create_task(
+                            discord.send_execution(
+                                opp,
+                                note=(
+                                    "CANCELLED (simulated). If only one leg had filled, "
+                                    "we would immediately unwind that leg (market/aggro limit)."
+                                    f"\nLatency: submit→cancel {submit_to_cancel_ms:.3f}ms"
+                                ),
+                                run_id=run_id,
+                                status="CANCELLED",
                             ),
-                            run_id=run_id,
-                            status="CANCELLED",
+                            name=f"exec-cancel-{opp.market_id}",
                         )
 
                     asyncio.create_task(_simulate_states(), name=f"dryrun-{opp.market_id}")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.error("Execution attempt failed: %s", exc)
 
     async def on_ws_error(exc: Exception) -> None:
         await discord.send_ops(f"WebSocket error: {exc}")
@@ -592,6 +753,7 @@ async def main() -> None:
     asyncio.create_task(_send_running_health_once(), name="health_once")
 
     tasks = [
+        asyncio.create_task(periodic_6h_summary(discord, db), name="summary_6h"),
         asyncio.create_task(ws_client.connect(), name="websocket"),
         asyncio.create_task(
             periodic_ops_debug(discord, ob_manager, start_time),
