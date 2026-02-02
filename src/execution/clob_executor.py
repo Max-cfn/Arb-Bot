@@ -7,8 +7,8 @@ from dataclasses import asdict
 from typing import Optional
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType, OpenOrderParams
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY, SELL
 
 from src.utils.logger import logger
 from .types import ExecutionMetrics, ExecutionResult
@@ -36,8 +36,10 @@ class PolymarketClobExecutor:
         self.funder_address = os.getenv("CLOB_FUNDER_ADDRESS", "XXXXXX").strip()  # replace
 
         # Tunables
-        self.order_timeout_s = float(os.getenv("CLOB_ORDER_TIMEOUT_S", "1.5"))
+        # Aggressive limit + short cancel window (user preference)
+        self.order_timeout_s = float(os.getenv("CLOB_ORDER_TIMEOUT_S", "0.4"))
         self.poll_interval_s = float(os.getenv("CLOB_POLL_INTERVAL_S", "0.05"))
+        self.cross_bps = float(os.getenv("CLOB_AGGRESSIVE_CROSS_BPS", "5"))  # 5 bps
 
         self._client: Optional[ClobClient] = None
 
@@ -93,89 +95,190 @@ class PolymarketClobExecutor:
 
         client = self._get_client()
 
-        def _submit_both_sync():
-            # Create signed limit orders. We use FOK to avoid leaving resting exposure.
-            yes = OrderArgs(token_id=str(opp.yes_token_id), price=yes_price, size=yes_size, side=BUY)
-            no = OrderArgs(token_id=str(opp.no_token_id), price=no_price, size=no_size, side=BUY)
+        # Aggressive limit prices: cross a few bps above best ask to improve fill probability.
+        def _aggressive_buy_limit(p: float) -> float:
+            p = float(p)
+            if p <= 0:
+                return p
+            bumped = p * (1.0 + (self.cross_bps / 10_000.0))
+            return float(min(0.9999, max(0.0001, bumped)))
 
-            signed_yes = client.create_order(yes)
-            signed_no = client.create_order(no)
+        yes_limit = _aggressive_buy_limit(yes_price)
+        no_limit = _aggressive_buy_limit(no_price)
 
-            resp_yes = client.post_order(signed_yes, OrderType.FOK)
-            resp_no = client.post_order(signed_no, OrderType.FOK)
-            return resp_yes, resp_no
+        yes_args = OrderArgs(token_id=str(opp.yes_token_id), price=yes_limit, size=yes_size, side=BUY)
+        no_args = OrderArgs(token_id=str(opp.no_token_id), price=no_limit, size=no_size, side=BUY)
 
         metrics.t_submit_ns = time.monotonic_ns()
 
         try:
-            resp_yes, resp_no = await asyncio.to_thread(_submit_both_sync)
+            # Pre-sign then submit in parallel (py-clob-client is sync => use threads)
+            t0 = time.monotonic_ns()
+            signed_yes, signed_no = await asyncio.gather(
+                asyncio.to_thread(lambda: client.create_order(yes_args)),
+                asyncio.to_thread(lambda: client.create_order(no_args)),
+            )
+            t_sign_ns = time.monotonic_ns()
+
+            resp_yes, resp_no = await asyncio.gather(
+                asyncio.to_thread(lambda: client.post_order(signed_yes, OrderType.GTC)),
+                asyncio.to_thread(lambda: client.post_order(signed_no, OrderType.GTC)),
+            )
             metrics.t_ack_ns = time.monotonic_ns()
 
             # Best-effort order ids
             yes_oid = (resp_yes or {}).get("orderID") or (resp_yes or {}).get("id")
             no_oid = (resp_no or {}).get("orderID") or (resp_no or {}).get("id")
 
+            submit_to_ack_ms = (metrics.t_ack_ns - metrics.t_submit_ns) / 1e6
+            detect_to_sign_ms = None
+            if isinstance(metrics.t_detect_ns, int):
+                detect_to_sign_ms = (t_sign_ns - metrics.t_detect_ns) / 1e6
+            sign_to_submit_ms = (metrics.t_submit_ns - t_sign_ns) / 1e6
+            sign_and_post_ms = (metrics.t_ack_ns - t0) / 1e6
+
             logger.info(
-                "EXEC_ACK run=%s yes_oid=%s no_oid=%s submit_to_ack_ms=%.3f resp_yes=%s resp_no=%s",
+                "EXEC_ACK run=%s yes_oid=%s no_oid=%s submit_to_ack_ms=%.3f sign_to_submit_ms=%.3f sign+post_ms=%.3f detect_to_sign_ms=%s resp_yes=%s resp_no=%s",
                 run_id,
                 yes_oid,
                 no_oid,
-                (metrics.t_ack_ns - metrics.t_submit_ns) / 1e6,
+                submit_to_ack_ms,
+                sign_to_submit_ms,
+                sign_and_post_ms,
+                f"{detect_to_sign_ms:.3f}" if detect_to_sign_ms is not None else "n/a",
                 str(resp_yes)[:500],
                 str(resp_no)[:500],
             )
 
-            # Poll open orders briefly to detect immediate cancellation vs fill.
-            # NOTE: For FOK, many outcomes will be immediate fill or immediate cancel.
-            async def _poll_open_once():
-                return await asyncio.to_thread(lambda: client.get_orders(OpenOrderParams()))
+            # Poll per-order status for a short window, then cancel anything still open.
+            async def _get_status(order_id: str | None) -> tuple[str, dict] | None:
+                if not order_id:
+                    return None
+                try:
+                    od = await asyncio.to_thread(lambda: client.get_order(order_id))
+                    if not isinstance(od, dict):
+                        return None
+                    st = str(od.get("status") or od.get("state") or "").upper()
+                    return st, od
+                except Exception:
+                    return None
+
+            def _is_done(st: str) -> bool:
+                # Be permissive with status vocabulary.
+                return st in {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "FAILED", "EXPIRED"}
 
             deadline = time.monotonic() + self.order_timeout_s
-            last_open = None
-            while time.monotonic() < deadline:
-                try:
-                    last_open = await _poll_open_once()
-                    open_ids = {o.get("id") for o in (last_open or []) if isinstance(o, dict)}
-                    # if order ids exist and are still open, keep waiting
-                    if (yes_oid and yes_oid in open_ids) or (no_oid and no_oid in open_ids):
-                        await asyncio.sleep(self.poll_interval_s)
-                        continue
-                    # Not open anymore => likely filled or cancelled
-                    break
-                except Exception:
-                    break
+            yes_done = False
+            no_done = False
+            yes_filled = False
+            no_filled = False
+            last_yes: dict = {}
+            last_no: dict = {}
 
-            # Without a dedicated fills endpoint here, we classify:
-            # - If neither id is open after polling window => treat as DONE (could be filled/cancelled)
-            # - If either remains open => CANCELLED via cancel_all (safety)
-            if last_open is not None:
-                open_ids = {o.get("id") for o in (last_open or []) if isinstance(o, dict)}
-                still_open = (yes_oid and yes_oid in open_ids) or (no_oid and no_oid in open_ids)
-            else:
-                still_open = False
+            while time.monotonic() < deadline and not (yes_done and no_done):
+                ys = await _get_status(str(yes_oid) if yes_oid else None)
+                ns = await _get_status(str(no_oid) if no_oid else None)
 
-            if still_open:
-                # Safety: cancel all outstanding orders
-                await asyncio.to_thread(client.cancel_all)
+                if ys is not None:
+                    yst, last_yes = ys
+                    if _is_done(yst):
+                        yes_done = True
+                    if yst == "FILLED":
+                        yes_filled = True
+
+                if ns is not None:
+                    nst, last_no = ns
+                    if _is_done(nst):
+                        no_done = True
+                    if nst == "FILLED":
+                        no_filled = True
+
+                if not (yes_done and no_done):
+                    await asyncio.sleep(self.poll_interval_s)
+
+            # Cancel whatever is still not done/open after timeout.
+            to_cancel: list[str] = []
+            if yes_oid and not yes_done:
+                to_cancel.append(str(yes_oid))
+            if no_oid and not no_done:
+                to_cancel.append(str(no_oid))
+
+            if to_cancel:
+                await asyncio.to_thread(lambda: client.cancel_orders(to_cancel))
                 metrics.t_cancel_ns = time.monotonic_ns()
+
+            # Classification:
+            if yes_filled and no_filled:
+                metrics.t_both_filled_ns = time.monotonic_ns()
                 return ExecutionResult(
-                    status="CANCELLED",
+                    status="FILLED",
                     run_id=run_id,
                     yes_order_id=str(yes_oid) if yes_oid else None,
                     no_order_id=str(no_oid) if no_oid else None,
-                    reason=f"Timeout; cancelled all. submit→cancel={(metrics.t_cancel_ns-metrics.t_submit_ns)/1e6:.3f}ms",
+                    reason=(
+                        f"Aggressive limit+cancel window {self.order_timeout_s:.3f}s. "
+                        f"submit→ack={(metrics.t_ack_ns-metrics.t_submit_ns)/1e6:.3f}ms submit→filled={(metrics.t_both_filled_ns-metrics.t_submit_ns)/1e6:.3f}ms"
+                    ),
                     metrics=metrics,
                 )
 
-            # Assume completed quickly (FOK semantics): mark as FILLED if both ids returned, else FAILED.
-            metrics.t_both_filled_ns = time.monotonic_ns()
-            status = "FILLED" if (yes_oid and no_oid) else "FAILED"
+            if yes_filled != no_filled:
+                # PARTIAL fill risk: attempt emergency unwind (best-effort).
+                metrics.t_first_fill_ns = time.monotonic_ns()
+                filled_token = str(opp.yes_token_id) if yes_filled else str(opp.no_token_id)
+                filled_leg = "YES" if yes_filled else "NO"
+                filled_info = last_yes if yes_filled else last_no
+
+                filled_size = 0.0
+                for k in ("sizeMatched", "filledSize", "matchedSize", "filled"):  # best-effort
+                    try:
+                        v = filled_info.get(k)
+                        if v is not None:
+                            filled_size = float(v)
+                            break
+                    except Exception:
+                        pass
+
+                async def _emergency_unwind() -> None:
+                    if filled_size <= 0:
+                        return
+                    try:
+                        from py_clob_client.clob_types import MarketOrderArgs
+
+                        mo = MarketOrderArgs(token_id=filled_token, amount=float(filled_size), side=SELL)
+                        signed = await asyncio.to_thread(lambda: client.create_market_order(mo))
+                        await asyncio.to_thread(lambda: client.post_order(signed, OrderType.FOK))
+                        logger.warning(
+                            "EXEC_UNWIND run=%s leg=%s token=%s size=%s status=SUBMITTED",
+                            run_id,
+                            filled_leg,
+                            filled_token,
+                            filled_size,
+                        )
+                    except Exception as exc:
+                        logger.error("EXEC_UNWIND_FAILED run=%s err=%s", run_id, exc)
+
+                await _emergency_unwind()
+
+                return ExecutionResult(
+                    status="PARTIAL",
+                    run_id=run_id,
+                    yes_order_id=str(yes_oid) if yes_oid else None,
+                    no_order_id=str(no_oid) if no_oid else None,
+                    reason=(
+                        f"Partial fill detected (filled {filled_leg}, other not). "
+                        f"Cancelled open orders after {self.order_timeout_s:.3f}s; attempted emergency unwind."
+                    ),
+                    metrics=metrics,
+                )
+
+            # Neither filled (or unknown) within window.
             return ExecutionResult(
-                status=status,  # best-effort
+                status="CANCELLED" if to_cancel else "FAILED",
                 run_id=run_id,
                 yes_order_id=str(yes_oid) if yes_oid else None,
                 no_order_id=str(no_oid) if no_oid else None,
-                reason=f"submit→ack={(metrics.t_ack_ns-metrics.t_submit_ns)/1e6:.3f}ms submit→done={(metrics.t_both_filled_ns-metrics.t_submit_ns)/1e6:.3f}ms",
+                reason=f"No dual fill within {self.order_timeout_s:.3f}s; cancelled_open={len(to_cancel)}",
                 metrics=metrics,
             )
 
