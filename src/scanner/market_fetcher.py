@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import aiohttp
 
 from src.utils.logger import logger
@@ -114,19 +115,50 @@ def _parse_market(raw: dict) -> dict | None:
 
 
 def _is_crypto_15min(raw: dict) -> bool:
-    """Heuristic: detect crypto 15-minute markets by slug/question patterns."""
+    """Heuristic: detect crypto 15-minute markets.
+
+    Signals:
+    - crypto keyword in slug/question/tags
+    - either explicit "15 min" text OR slug contains 15m/15min OR question encodes a 15-minute window
+      like "11:15AM-11:30AM ET".
+
+    This flag drives:
+    - stricter freshness gating (2s)
+    - fee schedule differences
+    """
     slug = (raw.get("slug") or "").lower()
     question = (raw.get("question") or "").lower()
-    tags = [t.lower() for t in (raw.get("tags") or [])]
+    tags = [str(t).lower() for t in (raw.get("tags") or [])]
 
-    crypto_keywords = {"btc", "eth", "bitcoin", "ethereum", "crypto", "sol", "solana"}
-    time_keywords = {"15 min", "15min", "15-min", "15 minute"}
-
+    crypto_keywords = {"btc", "eth", "bitcoin", "ethereum", "crypto", "sol", "solana", "xrp"}
     text = f"{slug} {question} {' '.join(tags)}"
     has_crypto = any(kw in text for kw in crypto_keywords)
-    has_time = any(kw in text for kw in time_keywords)
+    if not has_crypto:
+        return False
 
-    return has_crypto and has_time
+    # 1) direct time keywords
+    if any(k in text for k in {"15 min", "15min", "15-min", "15 minute"}):
+        return True
+
+    # 2) slug patterns used by Polymarket for 15m up/down markets
+    if ("15m" in slug or "15min" in slug or "-15m-" in slug) and ("updown" in slug or "up-or-down" in slug or "up_or_down" in slug):
+        return True
+
+    # 3) question time window like "11:15AM-11:30AM ET" => infer 15 minutes
+    m = re.search(r"(\d{1,2}):(\d{2})\s*(am|pm)\s*[-–]\s*(\d{1,2}):(\d{2})\s*(am|pm)", question)
+    if m:
+        h1, mm1, ap1, h2, mm2, ap2 = m.groups()
+        h1 = int(h1) % 12 + (12 if ap1 == "pm" else 0)
+        h2 = int(h2) % 12 + (12 if ap2 == "pm" else 0)
+        t1 = h1 * 60 + int(mm1)
+        t2 = h2 * 60 + int(mm2)
+        if t2 < t1:
+            t2 += 24 * 60
+        if (t2 - t1) == 15:
+            return True
+
+    return False
+
 
 
 def extract_all_token_ids(markets: list[dict]) -> list[str]:
