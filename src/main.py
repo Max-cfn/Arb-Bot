@@ -719,8 +719,21 @@ async def main() -> None:
 
                     if EXECUTION_MODE == "real":
                         metrics = ExecutionMetrics(t_detect_ns=t_detect_ns, t_submit_ns=t_submit_ns)
-                        # NOTE: do NOT block on Discord here; real execution handles its own acks/fills.
+                        # Measure end-to-end call duration (async wall time) so we can see how long the
+                        # execution "query" took, even when the CLOB call fails before ACK.
+                        call_start_ns = time.monotonic_ns()
                         res = await executor.execute_two_leg(opp, run_id=run_id, metrics=metrics)
+                        call_end_ns = time.monotonic_ns()
+                        call_ms = (call_end_ns - call_start_ns) / 1e6
+
+                        # Derive a few useful latencies when available
+                        submit_to_ack_ms = None
+                        try:
+                            if res.metrics and isinstance(res.metrics.t_ack_ns, int) and isinstance(res.metrics.t_submit_ns, int):
+                                submit_to_ack_ms = (res.metrics.t_ack_ns - res.metrics.t_submit_ns) / 1e6
+                        except Exception:
+                            submit_to_ack_ms = None
+
                         # Minimal reporting (async)
                         asyncio.create_task(
                             discord.send_execution(
@@ -732,6 +745,11 @@ async def main() -> None:
                                     + (
                                         f"yes_filled_size={getattr(res, 'yes_filled_size', None)} | "
                                         f"no_filled_size={getattr(res, 'no_filled_size', None)}\n"
+                                    )
+                                    + (
+                                        f"timings: detect→submit={f'{detect_to_send_ms:.1f}ms' if detect_to_send_ms is not None else 'n/a'} | "
+                                        f"submit→ack={f'{submit_to_ack_ms:.1f}ms' if submit_to_ack_ms is not None else 'n/a'} | "
+                                        f"exec_call={call_ms:.1f}ms\n"
                                     )
                                 ),
                                 run_id=run_id,
