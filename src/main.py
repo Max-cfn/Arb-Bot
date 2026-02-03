@@ -655,6 +655,10 @@ async def main() -> None:
                 now_ts = time.time()
                 if now_ts - last > 60:
                     on_orderbook_update._exec_last[opp.market_id] = now_ts  # type: ignore[attr-defined]
+
+                    # Always define a run_id for both real and dry-run paths
+                    run_id = f"{opp.market_id}-{int(now_ts)}"
+
                     t_detect_ns = getattr(opp, "_t_detect_ns", None)
                     t_send_ns = time.monotonic_ns()
                     t_submit_ns = t_send_ns  # alias for clarity
@@ -702,7 +706,6 @@ async def main() -> None:
                         return
 
                     # Simulated state machine (dry-run for now): SUBMITTED -> WAITING -> CANCELLED
-                    run_id = f"{opp.market_id}-{int(now_ts)}"
                     note0 = "Strategy: strict limit, send both ASAP; cancel fast; if single-fill => unwind immediately (dry-run)."
                     if detect_to_send_ms is not None:
                         note0 += f"\nLatency: detect→submit {detect_to_send_ms:.3f}ms"
