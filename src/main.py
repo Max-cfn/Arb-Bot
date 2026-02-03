@@ -741,6 +741,25 @@ async def main() -> None:
 
                     if EXECUTION_MODE == "real":
                         metrics = ExecutionMetrics(t_detect_ns=t_detect_ns, t_submit_ns=t_submit_ns)
+                        # Best-effort balance/allowance snapshot (for #executions visibility)
+                        bal_summary = None
+                        try:
+                            from py_clob_client.clob_types import BalanceAllowanceParams
+
+                            client = executor._get_client()  # uses derived API creds; does NOT place orders
+                            params = BalanceAllowanceParams(
+                                signature_type=int(getattr(executor, "signature_type", 0)),
+                                funder=str(getattr(executor, "funder_address", "")),
+                            )
+                            try:
+                                await asyncio.to_thread(lambda: client.update_balance_allowance(params))
+                            except Exception:
+                                pass
+                            bal = await asyncio.to_thread(lambda: client.get_balance_allowance(params))
+                            bal_summary = str(bal)[:500]
+                        except Exception:
+                            bal_summary = None
+
                         # Measure end-to-end call duration (async wall time) so we can see how long the
                         # execution "query" took, even when the CLOB call fails before ACK.
                         call_start_ns = time.monotonic_ns()
@@ -773,6 +792,7 @@ async def main() -> None:
                                         f"submit→ack={f'{submit_to_ack_ms:.1f}ms' if submit_to_ack_ms is not None else 'n/a'} | "
                                         f"exec_call={call_ms:.1f}ms\n"
                                     )
+                                    + (f"balance/allowance={bal_summary}\n" if bal_summary else "")
                                 ),
                                 run_id=run_id,
                                 status=res.status if res.status in {"SUBMITTED","WAITING","FILLED","CANCELLED","FAILED"} else "FAILED",
