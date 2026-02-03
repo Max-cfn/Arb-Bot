@@ -41,8 +41,14 @@ WS_PROBE_MAX_MSGS = 4
 # Trading control (killswitch)
 CONTROL_FILE = Path(os.getenv("POLY_CONTROL_FILE", "data/control.json"))
 
-# One-shot execution (safety): automatically disable trading after first execution attempt
+# One-shot execution (safety): automatically disable trading after N execution attempts
+# - If MAX_ONE_SHOT_TRADES>0, trading will be disabled after that many attempts.
+# - Back-compat: ONE_SHOT_TRADE=1 implies MAX_ONE_SHOT_TRADES=1 unless explicitly set.
 ONE_SHOT_TRADE = os.getenv("ONE_SHOT_TRADE", "0").strip() in {"1", "true", "True", "yes", "YES"}
+try:
+    MAX_ONE_SHOT_TRADES = int(os.getenv("MAX_ONE_SHOT_TRADES", "1" if ONE_SHOT_TRADE else "0").strip())
+except Exception:
+    MAX_ONE_SHOT_TRADES = 1 if ONE_SHOT_TRADE else 0
 
 # Execution mode: dry-run (default) or real
 EXECUTION_MODE = os.getenv("EXECUTION_MODE", "dryrun").strip().lower()
@@ -709,13 +715,29 @@ async def main() -> None:
                         f"{detect_to_send_ms:.3f}" if detect_to_send_ms is not None else "n/a",
                     )
 
-                    # One-shot safety: as soon as we decide to attempt an execution, flip killswitch OFF.
-                    if ONE_SHOT_TRADE:
-                        set_trading_enabled(False)
-                        asyncio.create_task(
-                            discord.send_ops(f"ONE_SHOT_TRADE: disabled trading after first execution attempt (market {opp.market_id})."),
-                            name="ops-oneshot",
-                        )
+                    # One-shot safety: as soon as we decide to attempt an execution, flip trading OFF
+                    # after MAX_ONE_SHOT_TRADES attempts.
+                    if MAX_ONE_SHOT_TRADES > 0:
+                        if not hasattr(on_orderbook_update, "_oneshot_count"):  # type: ignore[attr-defined]
+                            on_orderbook_update._oneshot_count = 0  # type: ignore[attr-defined]
+                        on_orderbook_update._oneshot_count += 1  # type: ignore[attr-defined]
+                        n = int(on_orderbook_update._oneshot_count)  # type: ignore[attr-defined]
+
+                        if n >= MAX_ONE_SHOT_TRADES:
+                            set_trading_enabled(False)
+                            asyncio.create_task(
+                                discord.send_ops(
+                                    f"ONE_SHOT_TRADE: disabled trading after execution attempt {n}/{MAX_ONE_SHOT_TRADES} (market {opp.market_id})."
+                                ),
+                                name="ops-oneshot",
+                            )
+                        else:
+                            asyncio.create_task(
+                                discord.send_ops(
+                                    f"ONE_SHOT_TRADE: attempt {n}/{MAX_ONE_SHOT_TRADES} (market {opp.market_id}); trading remains enabled."
+                                ),
+                                name="ops-oneshot-progress",
+                            )
 
                     if EXECUTION_MODE == "real":
                         metrics = ExecutionMetrics(t_detect_ns=t_detect_ns, t_submit_ns=t_submit_ns)
