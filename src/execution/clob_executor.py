@@ -8,7 +8,7 @@ from dataclasses import asdict
 from typing import Optional
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import OrderArgs, OrderType, BalanceAllowanceParams
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from src.utils.logger import logger
@@ -232,6 +232,19 @@ class PolymarketClobExecutor:
 
         client = self._get_client()
 
+        # Best-effort: fetch balance/allowance snapshot for debugging.
+        bal_info = None
+        try:
+            params = BalanceAllowanceParams(signature_type=int(self.signature_type), funder=str(self.funder_address))
+            # Some setups require an explicit refresh
+            try:
+                await asyncio.to_thread(lambda: client.update_balance_allowance(params))
+            except Exception:
+                pass
+            bal_info = await asyncio.to_thread(lambda: client.get_balance_allowance(params))
+        except Exception as exc:
+            bal_info = {"error": str(exc)[:200]}
+
         # Aggressive limit prices: cross a few bps above best ask to improve fill probability.
         def _aggressive_buy_limit(p: float) -> float:
             p = float(p)
@@ -275,6 +288,11 @@ class PolymarketClobExecutor:
             fee_bps_no=int(getattr(opp, "fee_rate_bps_no", 0) or 0),
             taker_fee_yes_pct=_safe_float(getattr(opp, "taker_fee_rate_percent_yes", 0.0)),
             taker_fee_no_pct=_safe_float(getattr(opp, "taker_fee_rate_percent_no", 0.0)),
+            auth={
+                "signature_type": int(self.signature_type),
+                "funder": _redact(str(self.funder_address)),
+            },
+            balance_allowance=(str(bal_info)[:1200] if bal_info is not None else None),
             policy={
                 "wait_for_both_ms": int(self.wait_for_both_s * 1000),
                 "poll_interval_ms": int(self.poll_interval_s * 1000),
