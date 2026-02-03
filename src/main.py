@@ -687,7 +687,12 @@ async def main() -> None:
                                 opp,
                                 note=(
                                     f"REAL_EXEC status={res.status}\n"
-                                    + (f"reason={res.reason}\n" if res.reason else "")
+                                    + (f"reason={getattr(res, 'reason_code', None) or 'n/a'}\n")
+                                    + (f"detail={res.reason}\n" if getattr(res, 'reason', '') else "")
+                                    + (
+                                        f"yes_filled_size={getattr(res, 'yes_filled_size', None)} | "
+                                        f"no_filled_size={getattr(res, 'no_filled_size', None)}\n"
+                                    )
                                 ),
                                 run_id=run_id,
                                 status=res.status if res.status in {"SUBMITTED","WAITING","FILLED","CANCELLED","FAILED"} else "FAILED",

@@ -402,9 +402,13 @@ class PolymarketClobExecutor:
                 oid = (resp or {}).get("orderID") or (resp or {}).get("id")
                 return str(oid) if oid else None
 
-            async def _unwind_sell(token_id: str, shares: float, buy_price: float) -> None:
+            async def _unwind_sell(token_id: str, shares: float, buy_price: float) -> tuple[bool, dict]:
+                """Attempt to unwind by SELLing filled shares with bounded loss.
+
+                Returns (ok, info).
+                """
                 if shares <= 0:
-                    return
+                    return False, {"reason": "shares<=0"}
 
                 # Percent bound
                 min_price_pct = float(buy_price) * (1.0 - self.unwind_max_loss_percent / 100.0)
@@ -428,19 +432,31 @@ class PolymarketClobExecutor:
                 if best_bid and best_bid > 0:
                     sell_price = max(min_sell_price, min(best_bid, buy_price))
 
-                sell_args = OrderArgs(token_id=str(token_id), price=float(sell_price), size=float(shares), side=SELL)
-                signed = await asyncio.to_thread(lambda: client.create_order(sell_args))
-                await asyncio.to_thread(lambda: client.post_order(signed, OrderType.FAK))
+                try:
+                    sell_args = OrderArgs(token_id=str(token_id), price=float(sell_price), size=float(shares), side=SELL)
+                    signed = await asyncio.to_thread(lambda: client.create_order(sell_args))
+                    resp = await asyncio.to_thread(lambda: client.post_order(signed, OrderType.FAK))
 
-                logger.warning(
-                    "EXEC_UNWIND run=%s token=%s shares=%.4f sell_price=%.4f min_sell_price=%.4f max_loss_usd=%.2f",
-                    run_id,
-                    token_id,
-                    float(shares),
-                    float(sell_price),
-                    float(min_sell_price),
-                    float(max_loss_usd),
-                )
+                    logger.warning(
+                        "EXEC_UNWIND run=%s token=%s shares=%.4f sell_price=%.4f min_sell_price=%.4f max_loss_usd=%.2f",
+                        run_id,
+                        token_id,
+                        float(shares),
+                        float(sell_price),
+                        float(min_sell_price),
+                        float(max_loss_usd),
+                    )
+                    return True, {
+                        "token": token_id,
+                        "shares": float(shares),
+                        "sell_price": float(sell_price),
+                        "min_sell_price": float(min_sell_price),
+                        "max_loss_usd": float(max_loss_usd),
+                        "resp": str(resp)[:500],
+                    }
+                except Exception as exc:
+                    logger.error("EXEC_UNWIND_FAILED run=%s err=%s", run_id, exc)
+                    return False, {"token": token_id, "shares": float(shares), "err": str(exc)[:200]}
 
             wait_deadline = time.monotonic() + self.wait_for_both_s
             last_yes: dict = {}
@@ -477,6 +493,9 @@ class PolymarketClobExecutor:
                             f"Complete within {self.wait_for_both_s*1000:.0f}ms. "
                             f"submit→ack={(metrics.t_ack_ns-metrics.t_submit_ns)/1e6:.3f}ms submit→filled={(metrics.t_both_filled_ns-metrics.t_submit_ns)/1e6:.3f}ms"
                         ),
+                        reason_code="BOTH_FILLED",
+                        yes_filled_size=float(yes_size_filled),
+                        no_filled_size=float(no_size_filled),
                         metrics=metrics,
                     )
                     self._log_exec(
@@ -526,6 +545,9 @@ class PolymarketClobExecutor:
                     reason=(
                         f"Recovery success (both legs filled>0). yes={yes_size_filled:.4f} no={no_size_filled:.4f} cancelled_open={len(to_cancel)}"
                     ),
+                    reason_code="RECOVERY_BOTH_FILLED",
+                    yes_filled_size=float(yes_size_filled),
+                    no_filled_size=float(no_size_filled),
                     metrics=metrics,
                 )
                 self._log_exec(
@@ -564,6 +586,9 @@ class PolymarketClobExecutor:
                             yes_order_id=str(yes_oid) if yes_oid else None,
                             no_order_id=str(retry_oid) if retry_oid else (str(no_oid) if no_oid else None),
                             reason=f"Retry succeeded within {self.retry_duration_s*1000:.0f}ms (+{self.retry_slippage_percent:.1f}% slippage).",
+                            reason_code="PARTIAL_RETRY_SUCCESS",
+                            yes_filled_size=float(yes_size_filled),
+                            no_filled_size=float(yes_size_filled),
                             metrics=metrics,
                         )
                         self._log_exec(
@@ -579,15 +604,19 @@ class PolymarketClobExecutor:
                         self._note_outcome(res.status)
                         return res
 
-                    await _unwind_sell(str(opp.yes_token_id), yes_size_filled, yes_limit)
+                    unwind_ok, unwind_info = await _unwind_sell(str(opp.yes_token_id), yes_size_filled, yes_limit)
                     res = ExecutionResult(
-                        status="PARTIAL",
+                        status="CANCELLED",
                         run_id=run_id,
                         yes_order_id=str(yes_oid) if yes_oid else None,
                         no_order_id=str(no_oid) if no_oid else None,
-                        reason=f"One-sided fill YES={yes_size_filled:.4f}; retry NO failed; unwound (max_loss_usd={max_loss_usd:.2f}).",
+                        reason=f"One-sided fill YES={yes_size_filled:.4f}; retry NO failed; unwind_ok={unwind_ok} (max_loss_usd={max_loss_usd:.2f}).",
+                        reason_code=("PARTIAL_UNWIND_OK" if unwind_ok else "PARTIAL_UNWIND_FAILED"),
+                        yes_filled_size=float(yes_size_filled),
+                        no_filled_size=0.0,
                         metrics=metrics,
                     )
+                    self._log_exec("unwind", run_id=run_id, ok=unwind_ok, info=unwind_info)
                     self._log_exec(
                         "result",
                         run_id=run_id,
@@ -620,6 +649,9 @@ class PolymarketClobExecutor:
                             yes_order_id=str(retry_oid) if retry_oid else (str(yes_oid) if yes_oid else None),
                             no_order_id=str(no_oid) if no_oid else None,
                             reason=f"Retry succeeded within {self.retry_duration_s*1000:.0f}ms (+{self.retry_slippage_percent:.1f}% slippage).",
+                            reason_code="PARTIAL_RETRY_SUCCESS",
+                            yes_filled_size=float(no_size_filled),
+                            no_filled_size=float(no_size_filled),
                             metrics=metrics,
                         )
                         self._log_exec(
@@ -635,15 +667,19 @@ class PolymarketClobExecutor:
                         self._note_outcome(res.status)
                         return res
 
-                    await _unwind_sell(str(opp.no_token_id), no_size_filled, no_limit)
+                    unwind_ok, unwind_info = await _unwind_sell(str(opp.no_token_id), no_size_filled, no_limit)
                     res = ExecutionResult(
-                        status="PARTIAL",
+                        status="CANCELLED",
                         run_id=run_id,
                         yes_order_id=str(yes_oid) if yes_oid else None,
                         no_order_id=str(no_oid) if no_oid else None,
-                        reason=f"One-sided fill NO={no_size_filled:.4f}; retry YES failed; unwound (max_loss_usd={max_loss_usd:.2f}).",
+                        reason=f"One-sided fill NO={no_size_filled:.4f}; retry YES failed; unwind_ok={unwind_ok} (max_loss_usd={max_loss_usd:.2f}).",
+                        reason_code=("PARTIAL_UNWIND_OK" if unwind_ok else "PARTIAL_UNWIND_FAILED"),
+                        yes_filled_size=0.0,
+                        no_filled_size=float(no_size_filled),
                         metrics=metrics,
                     )
+                    self._log_exec("unwind", run_id=run_id, ok=unwind_ok, info=unwind_info)
                     self._log_exec(
                         "result",
                         run_id=run_id,
@@ -664,6 +700,9 @@ class PolymarketClobExecutor:
                 yes_order_id=str(yes_oid) if yes_oid else None,
                 no_order_id=str(no_oid) if no_oid else None,
                 reason=f"ABORT: no BOTH filled; cancelled_open={len(to_cancel)} max_loss_usd={max_loss_usd:.2f}",
+                reason_code="TIMEOUT_NO_FILLS",
+                yes_filled_size=float(yes_size_filled),
+                no_filled_size=float(no_size_filled),
                 metrics=metrics,
             )
             self._log_exec(
