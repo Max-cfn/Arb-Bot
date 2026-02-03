@@ -501,6 +501,11 @@ async def main() -> None:
     detector = BinaryArbDetector(config)
     target_size_usd = config.target_size_usd
 
+    # --- Execution (REAL) ---
+    # Always instantiate the executor so EXECUTION_MODE can be flipped without code changes.
+    # The executor itself will refuse to trade if creds are missing/placeholders.
+    executor = PolymarketClobExecutor()
+
     # Startup health message
     ip = geo["ip"]
     await discord.send_health("Starting", {
