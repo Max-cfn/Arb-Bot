@@ -15,6 +15,22 @@ from src.utils.logger import logger
 from .types import ExecutionMetrics, ExecutionResult
 
 
+def _safe_float(x, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return float(default)
+
+
+def _redact(s: str, keep: int = 6) -> str:
+    if not s:
+        return ""
+    s = str(s)
+    if len(s) <= keep * 2:
+        return s
+    return s[:keep] + "…" + s[-keep:]
+
+
 class PolymarketClobExecutor:
     """Real Polymarket CLOB executor (via official `py-clob-client`).
 
@@ -62,6 +78,23 @@ class PolymarketClobExecutor:
 
     def _control_path(self) -> str:
         return os.getenv("CONTROL_FILE", "data/control.json")
+
+    def _log_exec(self, event: str, **fields) -> None:
+        """Structured execution logs (JSON) for debugging early live tests.
+
+        Never include secrets.
+        """
+        base = {
+            "event": event,
+            "ts": time.time(),
+            "component": "clob_executor",
+        }
+        base.update(fields)
+        try:
+            logger.info("EXEC_JSON %s", json.dumps(base, separators=(",", ":"), ensure_ascii=False)[:8000])
+        except Exception:
+            # Fall back to plain logs
+            logger.info("EXEC event=%s fields=%s", event, str(fields)[:2000])
 
     def _set_trading_enabled(self, enabled: bool) -> None:
         """Best-effort kill-switch toggle by writing control.json.
@@ -162,6 +195,11 @@ class PolymarketClobExecutor:
     async def execute_two_leg(self, opp, run_id: str, metrics: ExecutionMetrics) -> ExecutionResult:
         missing = self.missing_creds()
         if missing:
+            self._log_exec(
+                "creds_missing",
+                run_id=run_id,
+                missing=missing,
+            )
             return ExecutionResult(
                 status="FAILED",
                 run_id=run_id,
@@ -174,6 +212,13 @@ class PolymarketClobExecutor:
         yes_price = float(opp.yes_best_ask or opp.yes_ask_vwap)
         no_price = float(opp.no_best_ask or opp.no_ask_vwap)
         if yes_price <= 0 or no_price <= 0:
+            self._log_exec(
+                "invalid_prices",
+                run_id=run_id,
+                market_id=getattr(opp, "market_id", ""),
+                yes_price=yes_price,
+                no_price=no_price,
+            )
             return ExecutionResult(status="FAILED", run_id=run_id, reason="Invalid prices", metrics=metrics)
 
         yes_size = max(self.min_shares, float(opp.size_usd) / yes_price)
@@ -199,6 +244,50 @@ class PolymarketClobExecutor:
         est_total_cost = float(yes_limit * yes_size + no_limit * no_size)
         max_loss_usd = max(self.unwind_min_loss_usd, est_total_cost * 0.05)
 
+        # Initial execution context log (helps reproduce trades)
+        self._log_exec(
+            "start",
+            run_id=run_id,
+            market_id=getattr(opp, "market_id", ""),
+            condition_id=_redact(getattr(opp, "condition_id", "")),
+            slug=getattr(opp, "slug", "")[:120],
+            is_crypto_15min=bool(getattr(opp, "is_crypto_15min", False)),
+            end_date=getattr(opp, "end_date", ""),
+            yes_token=_redact(getattr(opp, "yes_token_id", "")),
+            no_token=_redact(getattr(opp, "no_token_id", "")),
+            yes_price_best=_safe_float(getattr(opp, "yes_best_ask", 0.0)),
+            no_price_best=_safe_float(getattr(opp, "no_best_ask", 0.0)),
+            yes_vwap=_safe_float(getattr(opp, "yes_ask_vwap", 0.0)),
+            no_vwap=_safe_float(getattr(opp, "no_ask_vwap", 0.0)),
+            combined_cost=_safe_float(getattr(opp, "combined_cost", 0.0)),
+            gross_edge_pct=_safe_float(getattr(opp, "gross_edge_percent", 0.0)),
+            net_edge_pct=_safe_float(getattr(opp, "net_edge_percent", 0.0)),
+            one_share_net_edge_pct=_safe_float(getattr(opp, "one_share_net_edge_percent", 0.0)),
+            yes_age_s=_safe_float(getattr(opp, "yes_book_age_s", 0.0)),
+            no_age_s=_safe_float(getattr(opp, "no_book_age_s", 0.0)),
+            fee_bps_yes=int(getattr(opp, "fee_rate_bps_yes", 0) or 0),
+            fee_bps_no=int(getattr(opp, "fee_rate_bps_no", 0) or 0),
+            taker_fee_yes_pct=_safe_float(getattr(opp, "taker_fee_rate_percent_yes", 0.0)),
+            taker_fee_no_pct=_safe_float(getattr(opp, "taker_fee_rate_percent_no", 0.0)),
+            policy={
+                "wait_for_both_ms": int(self.wait_for_both_s * 1000),
+                "poll_interval_ms": int(self.poll_interval_s * 1000),
+                "retry_duration_ms": int(self.retry_duration_s * 1000),
+                "retry_slippage_percent": self.retry_slippage_percent,
+                "unwind_max_loss_percent": self.unwind_max_loss_percent,
+                "max_loss_usd": round(max_loss_usd, 4),
+                "min_shares": self.min_shares,
+                "cross_bps": self.cross_bps,
+            },
+            sizing={
+                "yes_size": round(float(yes_size), 6),
+                "no_size": round(float(no_size), 6),
+                "yes_limit": round(float(yes_limit), 6),
+                "no_limit": round(float(no_limit), 6),
+                "est_total_cost": round(float(est_total_cost), 6),
+            },
+        )
+
         metrics.t_submit_ns = time.monotonic_ns()
 
         try:
@@ -215,6 +304,15 @@ class PolymarketClobExecutor:
                 asyncio.to_thread(lambda: client.post_order(signed_no, OrderType.GTC)),
             )
             metrics.t_ack_ns = time.monotonic_ns()
+
+            self._log_exec(
+                "submitted",
+                run_id=run_id,
+                t_submit_ns=metrics.t_submit_ns,
+                t_ack_ns=metrics.t_ack_ns,
+                submit_to_ack_ms=round((metrics.t_ack_ns - metrics.t_submit_ns) / 1e6, 3),
+                sign_ms=round((t_sign_ns - t0) / 1e6, 3),
+            )
 
             # Best-effort order ids
             yes_oid = (resp_yes or {}).get("orderID") or (resp_yes or {}).get("id")
@@ -238,6 +336,19 @@ class PolymarketClobExecutor:
                 f"{detect_to_sign_ms:.3f}" if detect_to_sign_ms is not None else "n/a",
                 str(resp_yes)[:500],
                 str(resp_no)[:500],
+            )
+
+            self._log_exec(
+                "ack",
+                run_id=run_id,
+                yes_oid=_redact(str(yes_oid) if yes_oid else ""),
+                no_oid=_redact(str(no_oid) if no_oid else ""),
+                resp_yes=str(resp_yes)[:800],
+                resp_no=str(resp_no)[:800],
+                submit_to_ack_ms=round(submit_to_ack_ms, 3),
+                sign_to_submit_ms=round(sign_to_submit_ms, 3),
+                sign_and_post_ms=round(sign_and_post_ms, 3),
+                detect_to_sign_ms=(round(detect_to_sign_ms, 3) if detect_to_sign_ms is not None else None),
             )
 
             # --- Complete-or-Abort execution policy ---
@@ -368,6 +479,15 @@ class PolymarketClobExecutor:
                         ),
                         metrics=metrics,
                     )
+                    self._log_exec(
+                        "result",
+                        run_id=run_id,
+                        status=res.status,
+                        reason=res.reason[:800],
+                        phase="wait_for_both",
+                        yes_size_filled=round(float(yes_size_filled), 6),
+                        no_size_filled=round(float(no_size_filled), 6),
+                    )
                     self._note_outcome(res.status)
                     return res
 
@@ -408,6 +528,16 @@ class PolymarketClobExecutor:
                     ),
                     metrics=metrics,
                 )
+                self._log_exec(
+                    "result",
+                    run_id=run_id,
+                    status=res.status,
+                    reason=res.reason[:800],
+                    phase="recovery_both_filled",
+                    yes_size_filled=round(float(yes_size_filled), 6),
+                    no_size_filled=round(float(no_size_filled), 6),
+                    cancelled_open=len(to_cancel),
+                )
                 self._note_outcome(res.status)
                 return res
 
@@ -436,6 +566,16 @@ class PolymarketClobExecutor:
                             reason=f"Retry succeeded within {self.retry_duration_s*1000:.0f}ms (+{self.retry_slippage_percent:.1f}% slippage).",
                             metrics=metrics,
                         )
+                        self._log_exec(
+                            "result",
+                            run_id=run_id,
+                            status=res.status,
+                            reason=res.reason[:800],
+                            phase="retry_other_leg_success",
+                            retry_leg="NO",
+                            retry_oid=_redact(str(retry_oid) if retry_oid else ""),
+                            yes_size_filled=round(float(yes_size_filled), 6),
+                        )
                         self._note_outcome(res.status)
                         return res
 
@@ -447,6 +587,16 @@ class PolymarketClobExecutor:
                         no_order_id=str(no_oid) if no_oid else None,
                         reason=f"One-sided fill YES={yes_size_filled:.4f}; retry NO failed; unwound (max_loss_usd={max_loss_usd:.2f}).",
                         metrics=metrics,
+                    )
+                    self._log_exec(
+                        "result",
+                        run_id=run_id,
+                        status=res.status,
+                        reason=res.reason[:800],
+                        phase="retry_other_leg_failed_unwind",
+                        filled_leg="YES",
+                        filled_shares=round(float(yes_size_filled), 6),
+                        max_loss_usd=round(float(max_loss_usd), 4),
                     )
                     self._note_outcome(res.status)
                     return res
@@ -472,6 +622,16 @@ class PolymarketClobExecutor:
                             reason=f"Retry succeeded within {self.retry_duration_s*1000:.0f}ms (+{self.retry_slippage_percent:.1f}% slippage).",
                             metrics=metrics,
                         )
+                        self._log_exec(
+                            "result",
+                            run_id=run_id,
+                            status=res.status,
+                            reason=res.reason[:800],
+                            phase="retry_other_leg_success",
+                            retry_leg="YES",
+                            retry_oid=_redact(str(retry_oid) if retry_oid else ""),
+                            no_size_filled=round(float(no_size_filled), 6),
+                        )
                         self._note_outcome(res.status)
                         return res
 
@@ -483,6 +643,16 @@ class PolymarketClobExecutor:
                         no_order_id=str(no_oid) if no_oid else None,
                         reason=f"One-sided fill NO={no_size_filled:.4f}; retry YES failed; unwound (max_loss_usd={max_loss_usd:.2f}).",
                         metrics=metrics,
+                    )
+                    self._log_exec(
+                        "result",
+                        run_id=run_id,
+                        status=res.status,
+                        reason=res.reason[:800],
+                        phase="retry_other_leg_failed_unwind",
+                        filled_leg="NO",
+                        filled_shares=round(float(no_size_filled), 6),
+                        max_loss_usd=round(float(max_loss_usd), 4),
                     )
                     self._note_outcome(res.status)
                     return res
@@ -496,9 +666,24 @@ class PolymarketClobExecutor:
                 reason=f"ABORT: no BOTH filled; cancelled_open={len(to_cancel)} max_loss_usd={max_loss_usd:.2f}",
                 metrics=metrics,
             )
+            self._log_exec(
+                "result",
+                run_id=run_id,
+                status=res.status,
+                reason=res.reason[:800],
+                phase="abort_no_fill",
+                cancelled_open=len(to_cancel),
+                max_loss_usd=round(float(max_loss_usd), 4),
+            )
             self._note_outcome(res.status)
             return res
 
         except Exception as exc:
+            self._log_exec(
+                "exception",
+                run_id=run_id,
+                err=str(exc)[:500],
+                metrics=asdict(metrics),
+            )
             logger.error("Real execution error run=%s metrics=%s err=%s", run_id, asdict(metrics), exc)
             return ExecutionResult(status="FAILED", run_id=run_id, reason=str(exc), metrics=metrics)
