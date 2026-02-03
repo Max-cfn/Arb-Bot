@@ -207,8 +207,8 @@ class PolymarketClobExecutor:
                 metrics=metrics,
             )
 
-        # Compute share sizes from USD budget per leg, but enforce MIN_SHARES.
-        # NOTE: For the test phase we intentionally trade small (e.g. 1 share).
+        # Compute share sizes.
+        # IMPORTANT: For early tests we want exactly 1 YES + 1 NO, NOT a USD budget sizing.
         yes_price = float(opp.yes_best_ask or opp.yes_ask_vwap)
         no_price = float(opp.no_best_ask or opp.no_ask_vwap)
         if yes_price <= 0 or no_price <= 0:
@@ -221,8 +221,14 @@ class PolymarketClobExecutor:
             )
             return ExecutionResult(status="FAILED", run_id=run_id, reason="Invalid prices", metrics=metrics)
 
-        yes_size = max(self.min_shares, float(opp.size_usd) / yes_price)
-        no_size = max(self.min_shares, float(opp.size_usd) / no_price)
+        force_min = os.getenv("FORCE_MIN_SHARES", "1").strip() in {"1", "true", "True", "yes", "YES"}
+        if force_min:
+            yes_size = float(self.min_shares)
+            no_size = float(self.min_shares)
+        else:
+            # Budget sizing fallback
+            yes_size = max(self.min_shares, float(opp.size_usd) / yes_price)
+            no_size = max(self.min_shares, float(opp.size_usd) / no_price)
 
         client = self._get_client()
 
