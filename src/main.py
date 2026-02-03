@@ -374,6 +374,42 @@ async def ws_probe_subscriptions(discord: DiscordClient, asset_ids: list[str]) -
         await asyncio.sleep(1)
 
 
+async def periodic_clob_http_probe(discord: DiscordClient) -> None:
+    """Periodically probe the CLOB HTTP endpoint to detect network issues.
+
+    Enabled by env: CLOB_HTTP_PROBE=1
+
+    Behavior:
+    - logs latency + status to OPS only on failures (to avoid spam)
+    - helps diagnose PolyApiException(status_code=None, Request exception!)
+    """
+    if os.getenv("CLOB_HTTP_PROBE", "0").strip() not in {"1", "true", "True", "yes", "YES"}:
+        return
+
+    import aiohttp
+
+    url = os.getenv("CLOB_BASE_URL", "https://clob.polymarket.com").rstrip("/") + "/"
+    fail_streak = 0
+
+    while True:
+        await asyncio.sleep(60)
+        t0 = time.time()
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    dt = (time.time() - t0) * 1000
+                    if resp.status >= 400:
+                        fail_streak += 1
+                        await discord.send_ops(f"CLOB_HTTP_PROBE fail status={resp.status} latency_ms={dt:.0f} streak={fail_streak}")
+                    else:
+                        fail_streak = 0
+        except Exception as exc:
+            dt = (time.time() - t0) * 1000
+            fail_streak += 1
+            await discord.send_ops(f"CLOB_HTTP_PROBE exception latency_ms={dt:.0f} streak={fail_streak} err={exc}")
+
+
 async def periodic_ops_debug(
     discord: DiscordClient,
     ob_manager: OrderbookManager,
@@ -814,6 +850,7 @@ async def main() -> None:
     tasks = [
         asyncio.create_task(periodic_6h_summary(discord, db), name="summary_6h"),
         asyncio.create_task(ws_client.connect(), name="websocket"),
+        asyncio.create_task(periodic_clob_http_probe(discord), name="clob_http_probe"),
         asyncio.create_task(
             periodic_ops_debug(discord, ob_manager, start_time),
             name="ops_debug",

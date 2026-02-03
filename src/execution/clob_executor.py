@@ -724,11 +724,52 @@ class PolymarketClobExecutor:
             return res
 
         except Exception as exc:
+            import traceback
+
+            err_s = str(exc)
+            err_repr = repr(exc)
+            err_type = type(exc).__name__
+            cause = getattr(exc, "__cause__", None)
+            context = getattr(exc, "__context__", None)
+
+            # Classify common failure modes (so we can tell "network" vs "rejected")
+            reason_code = None
+            if "Request exception" in err_s or "Request exception" in err_repr:
+                reason_code = "REQUEST_EXCEPTION"
+            elif "not enough balance" in err_s.lower() or "allowance" in err_s.lower():
+                reason_code = "NOT_ENOUGH_BALANCE_OR_ALLOWANCE"
+            else:
+                reason_code = "EXEC_EXCEPTION"
+
+            tb = traceback.format_exc(limit=6)
+
             self._log_exec(
                 "exception",
                 run_id=run_id,
-                err=str(exc)[:500],
+                reason_code=reason_code,
+                err=err_s[:800],
+                err_type=err_type,
+                err_repr=err_repr[:800],
+                cause=(repr(cause)[:400] if cause else None),
+                context=(repr(context)[:400] if context else None),
+                traceback=tb[:2000],
                 metrics=asdict(metrics),
             )
+
             logger.error("Real execution error run=%s metrics=%s err=%s", run_id, asdict(metrics), exc)
-            return ExecutionResult(status="FAILED", run_id=run_id, reason=str(exc), metrics=metrics)
+            res = ExecutionResult(
+                status="FAILED",
+                run_id=run_id,
+                reason=err_s,
+                reason_code=reason_code,
+                yes_filled_size=0.0,
+                no_filled_size=0.0,
+                metrics=metrics,
+            )
+            # Count this failure towards kill-switch thresholds
+            try:
+                # Failure should count toward consecutive failures kill-switch
+                self._note_outcome(res.status)
+            except Exception:
+                pass
+            return res
