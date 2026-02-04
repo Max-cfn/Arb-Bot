@@ -209,10 +209,11 @@ def format_opportunity_expired_embed(
     duration_s: float,
     last_edge_percent: float | None = None,
 ) -> dict[str, Any]:
-    """Follow-up message when an opportunity edge appears to have expired."""
+    """Follow-up message when an opportunity edge drops below the floor threshold."""
     edge = float(last_edge_percent) if last_edge_percent is not None else float(getattr(opp, "net_edge_percent", 0.0) or 0.0)
+    duration_ms = duration_s * 1000.0
     return {
-        "content": f"⏱️ **Opportunity expired** (last seen edge {edge:.2f}%)",
+        "content": f"⏱️ **Edge dropped < 1%** (last seen {edge:.2f}%)",
         "embeds": [
             {
                 "title": opp.market_question[:256],
@@ -224,8 +225,8 @@ def format_opportunity_expired_embed(
                 "color": EMBED_COLORS["info"],
                 "fields": [
                     {
-                        "name": "Edge lifetime (approx)",
-                        "value": f"~{duration_s:.1f}s",
+                        "name": "Edge lifetime",
+                        "value": f"{duration_s:.3f}s ({duration_ms:.0f}ms)",
                         "inline": True,
                     },
                     {

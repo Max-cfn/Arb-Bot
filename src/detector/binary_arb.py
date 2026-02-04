@@ -152,10 +152,9 @@ def detect_binary_arbitrage(
 
     # Apply safety buffer
     adjusted_edge = net_edge_percent - buffer_percent
-    if adjusted_edge < min_edge_percent:
-        return None
 
-    # Verdict
+    # Verdict (note: we still return the opportunity even if below thresholds,
+    # so callers can measure how long an edge persists and when it drops < 1%).
     if adjusted_edge >= 2.0:
         verdict = "ACTIONABLE"
     elif adjusted_edge >= 1.0:

@@ -681,29 +681,46 @@ async def main() -> None:
                 opp.taker_fee_rate_percent_no = _fee_rate_percent(opp.no_ask_vwap, opp.fee_rate_bps_no)
             except Exception:
                 pass
-            # Always emit opportunity alert + DB log, but NEVER block the trading path on Discord/IO
-            asyncio.create_task(discord.send_opportunity(opp), name=f"alert-opp-{opp.market_id}")
+            # --- Edge lifetime tracking (from >=1% down to <1%) ---
+            edge_floor = float(os.getenv("OPPORTUNITY_EDGE_FLOOR_PERCENT", "1.0"))
+            now_ts = time.time()
+
+            if not hasattr(on_orderbook_update, "_edge_lifetime"):  # type: ignore[attr-defined]
+                on_orderbook_update._edge_lifetime = {}  # type: ignore[attr-defined]
+
+            state = on_orderbook_update._edge_lifetime.get(opp.market_id)  # type: ignore[attr-defined]
+            edge_now = float(getattr(opp, "net_edge_percent", 0.0) or 0.0)
+
+            if edge_now >= edge_floor and opp.verdict in {"ACTIONABLE", "MARGINAL"}:
+                if not state or not state.get("active"):
+                    on_orderbook_update._edge_lifetime[opp.market_id] = {  # type: ignore[attr-defined]
+                        "active": True,
+                        "start_ts": now_ts,
+                        "last_ts": now_ts,
+                        "last_edge": edge_now,
+                    }
+                else:
+                    state["last_ts"] = now_ts
+                    state["last_edge"] = edge_now
+            else:
+                # If we previously had an edge >= floor, and now it dropped below, emit expiry message.
+                if state and state.get("active"):
+                    duration_s = float(now_ts - float(state.get("start_ts", now_ts)))
+                    last_edge = float(state.get("last_edge", edge_now))
+                    asyncio.create_task(
+                        discord.send_opportunity_expired(
+                            opp,
+                            duration_s=duration_s,
+                            last_edge_percent=last_edge,
+                        ),
+                        name=f"alert-expire-{opp.market_id}",
+                    )
+                    state["active"] = False
+
+            # Always emit DB log, but do NOT spam Discord with SKIP.
             asyncio.create_task(db.log_opportunity(opp), name=f"db-opp-{opp.market_id}")
-
-            # Also send a follow-up message when the edge appears to have expired (no refresh seen).
-            expiry_s = float(os.getenv("OPPORTUNITY_EXPIRY_SECONDS", "60"))
-            sent_ts = time.time()
-            sent_edge = float(getattr(opp, "net_edge_percent", 0.0) or 0.0)
-
-            async def _expire_followup(market_id: str, sent_ts: float, sent_edge: float) -> None:
-                try:
-                    await asyncio.sleep(expiry_s)
-                    last_info = getattr(on_orderbook_update, "_alert_last", {}).get(market_id)  # type: ignore[attr-defined]
-                    if not last_info:
-                        return
-                    _last_edge, last_ts = last_info
-                    # Only send expiry if no newer opportunity alert occurred for this market.
-                    if float(last_ts) <= float(sent_ts) + 1e-6:
-                        await discord.send_opportunity_expired(opp, duration_s=(time.time() - sent_ts), last_edge_percent=sent_edge)
-                except Exception:
-                    return
-
-            asyncio.create_task(_expire_followup(str(opp.market_id), sent_ts, sent_edge), name=f"alert-expire-{opp.market_id}")
+            if opp.verdict != "SKIP":
+                asyncio.create_task(discord.send_opportunity(opp), name=f"alert-opp-{opp.market_id}")
 
             # --- AUTOMATION: ATTEMPT EXECUTION IMMEDIATELY ---
             # If killswitch is OFF, we keep scanning/alerting but do not emit execution/trading actions.
