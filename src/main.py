@@ -750,7 +750,8 @@ async def main() -> None:
                                 note=(
                                     "REAL_EXEC attempt: placing YES+NO buy orders now\n"
                                     f"prices(best): yes={getattr(opp, 'yes_best_ask', None)} no={getattr(opp, 'no_best_ask', None)}\n"
-                                    "(sizing is computed by executor: min $1 notional + min shares; legs kept symmetric)"
+                                    "Sizing: shares = max(min_shares, min_order_shares, ceil($1 / cheaper_price)); legs symmetric\n"
+                                    f"Estimated total notional ≈ ${float(getattr(opp, 'yes_best_ask', 0.0) or 0.0) + float(getattr(opp, 'no_best_ask', 0.0) or 0.0):.4f} * shares (see next message for balance + result)"
                                 ),
                                 run_id=run_id,
                                 status="SUBMITTED",
@@ -761,6 +762,7 @@ async def main() -> None:
                         async def _real_execute_and_report() -> None:
                             # Best-effort balance/allowance snapshot (for #executions visibility)
                             bal_summary = None
+                            bal_usd = None
                             try:
                                 from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
 
@@ -774,7 +776,13 @@ async def main() -> None:
                                 except Exception:
                                     pass
                                 bal = await asyncio.to_thread(lambda: client.get_balance_allowance(params))
-                                bal_summary = str(bal)[:500]
+
+                                # CLOB returns collateral balance in micro-units (1e6 = $1)
+                                if isinstance(bal, dict) and "balance" in bal:
+                                    bal_usd = int(str(bal.get("balance") or "0")) / 1_000_000.0
+                                    bal_summary = f"balance_usd={bal_usd:.6f} allowances_n={len(bal.get('allowances') or {}) if isinstance(bal.get('allowances'), dict) else 'n/a'}"
+                                else:
+                                    bal_summary = str(bal)[:500]
                             except Exception:
                                 bal_summary = None
 

@@ -313,7 +313,16 @@ class PolymarketClobExecutor:
                 "signature_type": int(self.signature_type),
                 "funder": _redact(str(self.funder_address)),
             },
-            balance_allowance=(str(bal_info)[:1200] if bal_info is not None else None),
+            balance_allowance=(
+                (lambda b: (
+                    {
+                        "collateral_balance_usd": round(int(str(b.get("balance") or "0")) / 1_000_000.0, 6),
+                        "allowances_n": len(b.get("allowances") or {}) if isinstance(b.get("allowances"), dict) else None,
+                    }
+                    if isinstance(b, dict) and "balance" in b
+                    else (str(b)[:600] if b is not None else None)
+                ))(bal_info)
+            ),
             policy={
                 "wait_for_both_ms": int(self.wait_for_both_s * 1000),
                 "poll_interval_ms": int(self.poll_interval_s * 1000),
