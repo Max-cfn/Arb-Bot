@@ -8,7 +8,7 @@ from dataclasses import asdict
 from typing import Optional
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType, BalanceAllowanceParams
+from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType, BalanceAllowanceParams
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from src.utils.logger import logger
@@ -187,8 +187,16 @@ class PolymarketClobExecutor:
                 signature_type=self.signature_type,
                 funder=self.funder_address,
             )
-            # API creds are derived from wallet signing
-            client.set_api_creds(client.create_or_derive_api_creds())
+            # API creds: prefer explicit env vars (stable for proxy accounts), else derive via signing.
+            api_key = os.getenv("CLOB_API_KEY", "").strip()
+            api_secret = os.getenv("CLOB_API_SECRET", "").strip()
+            api_passphrase = os.getenv("CLOB_API_PASSPHRASE", "").strip()
+
+            if api_key and api_secret and api_passphrase:
+                client.set_api_creds(ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase))
+            else:
+                client.set_api_creds(client.create_or_derive_api_creds())
+
             self._client = client
         return self._client
 
@@ -208,7 +216,9 @@ class PolymarketClobExecutor:
             )
 
         # Compute share sizes.
-        # IMPORTANT: For early tests we want exactly 1 YES + 1 NO, NOT a USD budget sizing.
+        # Goal: Polymarket enforces a ~$1 minimum order notional.
+        # We buy enough shares on the cheaper leg to reach >= $1 notional,
+        # and buy the exact same number of shares on the other leg.
         yes_price = float(opp.yes_best_ask or opp.yes_ask_vwap)
         no_price = float(opp.no_best_ask or opp.no_ask_vwap)
         if yes_price <= 0 or no_price <= 0:
@@ -221,14 +231,19 @@ class PolymarketClobExecutor:
             )
             return ExecutionResult(status="FAILED", run_id=run_id, reason="Invalid prices", metrics=metrics)
 
-        force_min = os.getenv("FORCE_MIN_SHARES", "1").strip() in {"1", "true", "True", "yes", "YES"}
-        if force_min:
-            yes_size = float(self.min_shares)
-            no_size = float(self.min_shares)
-        else:
-            # Budget sizing fallback
-            yes_size = max(self.min_shares, float(opp.size_usd) / yes_price)
-            no_size = max(self.min_shares, float(opp.size_usd) / no_price)
+        min_order_usd = float(os.getenv("CLOB_MIN_ORDER_USD", "1.0"))
+        min_shares = float(self.min_shares)
+
+        import math
+
+        cheaper_price = min(yes_price, no_price)
+        shares_for_min_notional = int(math.ceil(min_order_usd / cheaper_price)) if cheaper_price > 0 else 0
+        shares_floor = int(math.ceil(min_shares))
+        shares = max(shares_floor, shares_for_min_notional)
+
+        # Keep legs symmetric in shares (binary arb).
+        yes_size = float(shares)
+        no_size = float(shares)
 
         client = self._get_client()
 
