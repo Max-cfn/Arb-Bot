@@ -33,4 +33,11 @@ class ExecutionResult:
     yes_filled_size: Optional[float] = None
     no_filled_size: Optional[float] = None
 
+    # Planned order details (for Discord visibility / debugging)
+    planned_yes_size: Optional[float] = None
+    planned_no_size: Optional[float] = None
+    planned_yes_limit: Optional[float] = None
+    planned_no_limit: Optional[float] = None
+    planned_est_total_cost: Optional[float] = None
+
     metrics: Optional[ExecutionMetrics] = None

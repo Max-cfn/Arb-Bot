@@ -203,6 +203,47 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
     }
 
 
+def format_opportunity_expired_embed(
+    opp: ArbitrageOpportunity,
+    *,
+    duration_s: float,
+    last_edge_percent: float | None = None,
+) -> dict[str, Any]:
+    """Follow-up message when an opportunity edge appears to have expired."""
+    edge = float(last_edge_percent) if last_edge_percent is not None else float(getattr(opp, "net_edge_percent", 0.0) or 0.0)
+    return {
+        "content": f"⏱️ **Opportunity expired** (last seen edge {edge:.2f}%)",
+        "embeds": [
+            {
+                "title": opp.market_question[:256],
+                "url": (
+                    f"https://polymarket.com/market/{opp.slug}"
+                    if getattr(opp, "slug", "")
+                    else None
+                ),
+                "color": EMBED_COLORS["info"],
+                "fields": [
+                    {
+                        "name": "Edge lifetime (approx)",
+                        "value": f"~{duration_s:.1f}s",
+                        "inline": True,
+                    },
+                    {
+                        "name": "Last observed (best asks)",
+                        "value": (
+                            f"YES: ${float(getattr(opp, 'yes_best_ask', 0.0) or 0.0):.4f}\n"
+                            f"NO:  ${float(getattr(opp, 'no_best_ask', 0.0) or 0.0):.4f}"
+                        ),
+                        "inline": True,
+                    },
+                ],
+                "footer": {"text": f"Market ID: {str(opp.market_id)[:16]}..."},
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        ],
+    }
+
+
 def format_execution_embed(
     opp: ArbitrageOpportunity,
     note: str = "",

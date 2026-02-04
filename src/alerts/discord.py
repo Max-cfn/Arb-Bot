@@ -12,6 +12,7 @@ from src.alerts.formatters import (
     format_health_embed,
     format_ops_embed,
     format_opportunity_embed,
+    format_opportunity_expired_embed,
     format_execution_embed,
 )
 from src.config import Config
@@ -79,6 +80,17 @@ class DiscordClient:
             "Sending opportunity alert: %s (net edge %.2f%%)",
             opp.market_question[:60], opp.net_edge_percent,
         )
+        return await self._send("opportunities", payload)
+
+    async def send_opportunity_expired(
+        self,
+        opp: ArbitrageOpportunity,
+        *,
+        duration_s: float,
+        last_edge_percent: float | None = None,
+    ) -> bool:
+        """Send a follow-up message when an opportunity seems to have expired."""
+        payload = format_opportunity_expired_embed(opp, duration_s=duration_s, last_edge_percent=last_edge_percent)
         return await self._send("opportunities", payload)
 
     async def send_execution(

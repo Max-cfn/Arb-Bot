@@ -685,6 +685,26 @@ async def main() -> None:
             asyncio.create_task(discord.send_opportunity(opp), name=f"alert-opp-{opp.market_id}")
             asyncio.create_task(db.log_opportunity(opp), name=f"db-opp-{opp.market_id}")
 
+            # Also send a follow-up message when the edge appears to have expired (no refresh seen).
+            expiry_s = float(os.getenv("OPPORTUNITY_EXPIRY_SECONDS", "60"))
+            sent_ts = time.time()
+            sent_edge = float(getattr(opp, "net_edge_percent", 0.0) or 0.0)
+
+            async def _expire_followup(market_id: str, sent_ts: float, sent_edge: float) -> None:
+                try:
+                    await asyncio.sleep(expiry_s)
+                    last_info = getattr(on_orderbook_update, "_alert_last", {}).get(market_id)  # type: ignore[attr-defined]
+                    if not last_info:
+                        return
+                    _last_edge, last_ts = last_info
+                    # Only send expiry if no newer opportunity alert occurred for this market.
+                    if float(last_ts) <= float(sent_ts) + 1e-6:
+                        await discord.send_opportunity_expired(opp, duration_s=(time.time() - sent_ts), last_edge_percent=sent_edge)
+                except Exception:
+                    return
+
+            asyncio.create_task(_expire_followup(str(opp.market_id), sent_ts, sent_edge), name=f"alert-expire-{opp.market_id}")
+
             # --- AUTOMATION: ATTEMPT EXECUTION IMMEDIATELY ---
             # If killswitch is OFF, we keep scanning/alerting but do not emit execution/trading actions.
             if not is_trading_enabled():
@@ -743,15 +763,39 @@ async def main() -> None:
                     if EXECUTION_MODE == "real":
                         metrics = ExecutionMetrics(t_detect_ns=t_detect_ns, t_submit_ns=t_submit_ns)
 
+                        # Pre-compute an explicit estimate for: shares + attempted cost (USD) so #executions is actionable.
+                        import math
+
+                        min_order_usd = float(os.getenv("CLOB_MIN_ORDER_USD", "1.0"))
+                        min_order_shares = float(os.getenv("CLOB_MIN_ORDER_SHARES", "5"))
+                        min_shares = float(getattr(executor, "min_shares", 1.0))
+                        cross_bps = float(getattr(executor, "cross_bps", 0.0))
+
+                        yes_best = float(getattr(opp, "yes_best_ask", 0.0) or 0.0)
+                        no_best = float(getattr(opp, "no_best_ask", 0.0) or 0.0)
+                        cheaper = min(yes_best, no_best) if yes_best > 0 and no_best > 0 else max(yes_best, no_best)
+                        shares_for_min_notional = int(math.ceil(min_order_usd / cheaper)) if cheaper and cheaper > 0 else 1
+                        shares = int(max(math.ceil(min_shares), math.ceil(min_order_shares), shares_for_min_notional))
+
+                        def _aggressive_buy_limit(p: float) -> float:
+                            if p <= 0:
+                                return p
+                            bumped = p * (1.0 + (cross_bps / 10_000.0))
+                            return float(min(0.9999, max(0.0001, bumped)))
+
+                        yes_limit_est = _aggressive_buy_limit(yes_best)
+                        no_limit_est = _aggressive_buy_limit(no_best)
+                        attempted_cost_usd = float(shares * (yes_limit_est + no_limit_est))
+
                         # Send an immediate "attempt" message so #executions reflects real order attempts.
                         asyncio.create_task(
                             discord.send_execution(
                                 opp,
                                 note=(
                                     "REAL_EXEC attempt: placing YES+NO buy orders now\n"
-                                    f"prices(best): yes={getattr(opp, 'yes_best_ask', None)} no={getattr(opp, 'no_best_ask', None)}\n"
-                                    "Sizing: shares = max(min_shares, min_order_shares, ceil($1 / cheaper_price)); legs symmetric\n"
-                                    f"Estimated total notional ≈ ${float(getattr(opp, 'yes_best_ask', 0.0) or 0.0) + float(getattr(opp, 'no_best_ask', 0.0) or 0.0):.4f} * shares (see next message for balance + result)"
+                                    f"balance_usd=? (next msg) | attempted_cost_usd≈{attempted_cost_usd:.4f}\n"
+                                    f"shares={shares} (YES+NO) | yes_limit≈{yes_limit_est:.4f} no_limit≈{no_limit_est:.4f}\n"
+                                    f"inputs(best): yes={yes_best:.4f} no={no_best:.4f} | min_order_usd={min_order_usd} min_order_shares={min_order_shares} cross_bps={cross_bps}"
                                 ),
                                 run_id=run_id,
                                 status="SUBMITTED",
@@ -804,6 +848,14 @@ async def main() -> None:
                                     f"REAL_EXEC result status={res.status}\n"
                                     + (f"reason={getattr(res, 'reason_code', None) or 'n/a'}\n")
                                     + (f"detail={res.reason}\n" if getattr(res, 'reason', '') else "")
+                                    + (
+                                        f"balance_usd={bal_usd:.6f} | attempted_cost_usd≈{attempted_cost_usd:.4f}\n"
+                                        if bal_usd is not None
+                                        else f"attempted_cost_usd≈{attempted_cost_usd:.4f}\n"
+                                    )
+                                    + (
+                                        f"shares={shares} | yes_limit≈{yes_limit_est:.4f} no_limit≈{no_limit_est:.4f}\n"
+                                    )
                                     + (
                                         f"yes_filled_size={getattr(res, 'yes_filled_size', None)} | "
                                         f"no_filled_size={getattr(res, 'no_filled_size', None)}\n"
