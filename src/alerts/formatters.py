@@ -226,7 +226,7 @@ def format_opportunity_expired_embed(
                 "fields": [
                     {
                         "name": "Edge lifetime",
-                        "value": f"{duration_s:.3f}s ({duration_ms:.0f}ms)",
+                        "value": f"{duration_s:.6f}s ({duration_ms:.0f}ms)",
                         "inline": True,
                     },
                     {
