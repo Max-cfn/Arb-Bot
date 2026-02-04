@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import math
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -64,6 +65,29 @@ def _format_time_left(end_date: str) -> str:
     return f"{m}m"
 
 
+def _format_plan_min_notional(opp: ArbitrageOpportunity, *, min_order_usd: float = 1.0) -> str:
+    yes_p = float(getattr(opp, "yes_best_ask", 0.0) or 0.0)
+    no_p = float(getattr(opp, "no_best_ask", 0.0) or 0.0)
+    cheaper = min(yes_p, no_p) if yes_p > 0 and no_p > 0 else max(yes_p, no_p)
+
+    shares = 1
+    if cheaper and cheaper > 0:
+        shares = max(1, int(math.ceil(min_order_usd / cheaper)))
+
+    total_cost = shares * (yes_p + no_p)
+    est_profit = shares * float(getattr(opp, "one_share_net_profit", 0.0) or 0.0)
+
+    return (
+        f"YES ask: ${yes_p:.4f}\n"
+        f"NO ask:  ${no_p:.4f}\n"
+        f"Shares: {shares} YES + {shares} NO\n"
+        f"Total cost: ${total_cost:.4f}\n"
+        f"Net edge (per 1+1): {float(getattr(opp, 'one_share_net_edge_percent', 0.0) or 0.0):.2f}% "
+        f"(profit ${float(getattr(opp, 'one_share_net_profit', 0.0) or 0.0):.4f})\n"
+        f"Est. profit @shares: ${est_profit:.4f}"
+    )
+
+
 def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
     """Format an arbitrage opportunity as a Discord webhook payload."""
     if opp.verdict == "ACTIONABLE":
@@ -122,13 +146,8 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
                         "inline": True,
                     },
                     {
-                        "name": "Plan (1 YES + 1 NO)",
-                        "value": (
-                            f"YES ask: ${opp.yes_best_ask:.4f}\n"
-                            f"NO ask: ${opp.no_best_ask:.4f}\n"
-                            f"Sum: ${opp.combined_best_asks:.4f}\n"
-                            f"Net: {opp.one_share_net_edge_percent:.2f}% (profit ${opp.one_share_net_profit:.4f})"
-                        ),
+                        "name": "Plan (min $1 notional)",
+                        "value": _format_plan_min_notional(opp, min_order_usd=1.0),
                         "inline": True,
                     },
                     {
