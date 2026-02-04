@@ -232,13 +232,16 @@ class PolymarketClobExecutor:
             return ExecutionResult(status="FAILED", run_id=run_id, reason="Invalid prices", metrics=metrics)
 
         min_order_usd = float(os.getenv("CLOB_MIN_ORDER_USD", "1.0"))
+        # Polymarket also enforces a minimum *share size* on some markets (often 5).
+        # Keep this configurable so we can tune without code changes.
+        min_order_shares = float(os.getenv("CLOB_MIN_ORDER_SHARES", "5"))
         min_shares = float(self.min_shares)
 
         import math
 
         cheaper_price = min(yes_price, no_price)
         shares_for_min_notional = int(math.ceil(min_order_usd / cheaper_price)) if cheaper_price > 0 else 0
-        shares_floor = int(math.ceil(min_shares))
+        shares_floor = int(math.ceil(max(min_shares, min_order_shares)))
         shares = max(shares_floor, shares_for_min_notional)
 
         # Keep legs symmetric in shares (binary arb).
