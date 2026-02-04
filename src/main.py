@@ -695,7 +695,8 @@ async def main() -> None:
                     on_orderbook_update._exec_last = {}  # type: ignore[attr-defined]
                 last = on_orderbook_update._exec_last.get(opp.market_id, 0)  # type: ignore[attr-defined]
                 now_ts = time.time()
-                if now_ts - last > 60:
+                dedup_s = float(os.getenv("EXEC_DEDUP_SECONDS", "0"))
+                if now_ts - last > dedup_s:
                     on_orderbook_update._exec_last[opp.market_id] = now_ts  # type: ignore[attr-defined]
 
                     # Always define a run_id for both real and dry-run paths
@@ -741,46 +742,58 @@ async def main() -> None:
 
                     if EXECUTION_MODE == "real":
                         metrics = ExecutionMetrics(t_detect_ns=t_detect_ns, t_submit_ns=t_submit_ns)
-                        # Best-effort balance/allowance snapshot (for #executions visibility)
-                        bal_summary = None
-                        try:
-                            from py_clob_client.clob_types import BalanceAllowanceParams
 
-                            client = executor._get_client()  # uses derived API creds; does NOT place orders
-                            params = BalanceAllowanceParams(
-                                signature_type=int(getattr(executor, "signature_type", 0)),
-                                funder=str(getattr(executor, "funder_address", "")),
-                            )
-                            try:
-                                await asyncio.to_thread(lambda: client.update_balance_allowance(params))
-                            except Exception:
-                                pass
-                            bal = await asyncio.to_thread(lambda: client.get_balance_allowance(params))
-                            bal_summary = str(bal)[:500]
-                        except Exception:
-                            bal_summary = None
-
-                        # Measure end-to-end call duration (async wall time) so we can see how long the
-                        # execution "query" took, even when the CLOB call fails before ACK.
-                        call_start_ns = time.monotonic_ns()
-                        res = await executor.execute_two_leg(opp, run_id=run_id, metrics=metrics)
-                        call_end_ns = time.monotonic_ns()
-                        call_ms = (call_end_ns - call_start_ns) / 1e6
-
-                        # Derive a few useful latencies when available
-                        submit_to_ack_ms = None
-                        try:
-                            if res.metrics and isinstance(res.metrics.t_ack_ns, int) and isinstance(res.metrics.t_submit_ns, int):
-                                submit_to_ack_ms = (res.metrics.t_ack_ns - res.metrics.t_submit_ns) / 1e6
-                        except Exception:
-                            submit_to_ack_ms = None
-
-                        # Minimal reporting (async)
+                        # Send an immediate "attempt" message so #executions reflects real order attempts.
                         asyncio.create_task(
                             discord.send_execution(
                                 opp,
                                 note=(
-                                    f"REAL_EXEC status={res.status}\n"
+                                    "REAL_EXEC attempt: placing YES+NO buy orders now\n"
+                                    f"prices(best): yes={getattr(opp, 'yes_best_ask', None)} no={getattr(opp, 'no_best_ask', None)}\n"
+                                    "(sizing is computed by executor: min $1 notional + min shares; legs kept symmetric)"
+                                ),
+                                run_id=run_id,
+                                status="SUBMITTED",
+                            ),
+                            name=f"exec-real-attempt-{opp.market_id}",
+                        )
+
+                        async def _real_execute_and_report() -> None:
+                            # Best-effort balance/allowance snapshot (for #executions visibility)
+                            bal_summary = None
+                            try:
+                                from py_clob_client.clob_types import BalanceAllowanceParams
+
+                                client = executor._get_client()  # uses API creds; does NOT place orders
+                                params = BalanceAllowanceParams(
+                                    signature_type=int(getattr(executor, "signature_type", 0)),
+                                    funder=str(getattr(executor, "funder_address", "")),
+                                )
+                                try:
+                                    await asyncio.to_thread(lambda: client.update_balance_allowance(params))
+                                except Exception:
+                                    pass
+                                bal = await asyncio.to_thread(lambda: client.get_balance_allowance(params))
+                                bal_summary = str(bal)[:500]
+                            except Exception:
+                                bal_summary = None
+
+                            call_start_ns = time.monotonic_ns()
+                            res = await executor.execute_two_leg(opp, run_id=run_id, metrics=metrics)
+                            call_end_ns = time.monotonic_ns()
+                            call_ms = (call_end_ns - call_start_ns) / 1e6
+
+                            submit_to_ack_ms = None
+                            try:
+                                if res.metrics and isinstance(res.metrics.t_ack_ns, int) and isinstance(res.metrics.t_submit_ns, int):
+                                    submit_to_ack_ms = (res.metrics.t_ack_ns - res.metrics.t_submit_ns) / 1e6
+                            except Exception:
+                                submit_to_ack_ms = None
+
+                            await discord.send_execution(
+                                opp,
+                                note=(
+                                    f"REAL_EXEC result status={res.status}\n"
                                     + (f"reason={getattr(res, 'reason_code', None) or 'n/a'}\n")
                                     + (f"detail={res.reason}\n" if getattr(res, 'reason', '') else "")
                                     + (
@@ -796,10 +809,10 @@ async def main() -> None:
                                 ),
                                 run_id=run_id,
                                 status=res.status if res.status in {"SUBMITTED","WAITING","FILLED","CANCELLED","FAILED"} else "FAILED",
-                            ),
-                            name=f"exec-real-report-{opp.market_id}",
-                        )
-                        return
+                            )
+
+                        asyncio.create_task(_real_execute_and_report(), name=f"exec-real-{opp.market_id}")
+                        continue
 
                     # Simulated state machine (dry-run for now): SUBMITTED -> WAITING -> CANCELLED
                     note0 = "Strategy: strict limit, send both ASAP; cancel fast; if single-fill => unwind immediately (dry-run)."
