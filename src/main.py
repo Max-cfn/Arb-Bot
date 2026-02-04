@@ -681,12 +681,47 @@ async def main() -> None:
                 opp.taker_fee_rate_percent_no = _fee_rate_percent(opp.no_ask_vwap, opp.fee_rate_bps_no)
             except Exception:
                 pass
-            # --- Edge lifetime tracking (from >=1% down to <1%) ---
+            # --- Edge lifetime tracking (from >=1% until it disappears / drops) ---
+            # NOTE: When combined_cost>=1, detector returns None => we won't see an explicit <1% update.
+            # So we track 'last_ts' while edge>=floor, and a sweeper expires edges that haven't been
+            # observed for a short grace window.
             edge_floor = float(os.getenv("OPPORTUNITY_EDGE_FLOOR_PERCENT", "1.0"))
+            expire_grace_s = float(os.getenv("OPPORTUNITY_EDGE_EXPIRE_GRACE_SECONDS", "2.0"))
             now_ts = time.time()
 
             if not hasattr(on_orderbook_update, "_edge_lifetime"):  # type: ignore[attr-defined]
                 on_orderbook_update._edge_lifetime = {}  # type: ignore[attr-defined]
+
+            # Start sweeper once.
+            if not hasattr(on_orderbook_update, "_edge_lifetime_sweeper_started"):  # type: ignore[attr-defined]
+                on_orderbook_update._edge_lifetime_sweeper_started = True  # type: ignore[attr-defined]
+
+                async def _edge_lifetime_sweeper() -> None:
+                    while True:
+                        try:
+                            await asyncio.sleep(0.5)
+                            state_map = getattr(on_orderbook_update, "_edge_lifetime", {})  # type: ignore[attr-defined]
+                            now2 = time.time()
+                            for mid, st in list(state_map.items()):
+                                if not isinstance(st, dict) or not st.get("active"):
+                                    continue
+                                last_ts = float(st.get("last_ts", 0.0) or 0.0)
+                                if (now2 - last_ts) >= expire_grace_s:
+                                    start_ts = float(st.get("start_ts", last_ts) or last_ts)
+                                    duration_s = float(max(0.0, last_ts - start_ts))
+                                    last_edge = float(st.get("last_edge", 0.0) or 0.0)
+                                    last_opp = st.get("last_opp")
+                                    if last_opp is not None:
+                                        await discord.send_opportunity_expired(
+                                            last_opp,
+                                            duration_s=duration_s,
+                                            last_edge_percent=last_edge,
+                                        )
+                                    st["active"] = False
+                        except Exception:
+                            continue
+
+                asyncio.create_task(_edge_lifetime_sweeper(), name="edge-lifetime-sweeper")
 
             state = on_orderbook_update._edge_lifetime.get(opp.market_id)  # type: ignore[attr-defined]
             edge_now = float(getattr(opp, "net_edge_percent", 0.0) or 0.0)
@@ -698,24 +733,12 @@ async def main() -> None:
                         "start_ts": now_ts,
                         "last_ts": now_ts,
                         "last_edge": edge_now,
+                        "last_opp": opp,
                     }
                 else:
                     state["last_ts"] = now_ts
                     state["last_edge"] = edge_now
-            else:
-                # If we previously had an edge >= floor, and now it dropped below, emit expiry message.
-                if state and state.get("active"):
-                    duration_s = float(now_ts - float(state.get("start_ts", now_ts)))
-                    last_edge = float(state.get("last_edge", edge_now))
-                    asyncio.create_task(
-                        discord.send_opportunity_expired(
-                            opp,
-                            duration_s=duration_s,
-                            last_edge_percent=last_edge,
-                        ),
-                        name=f"alert-expire-{opp.market_id}",
-                    )
-                    state["active"] = False
+                    state["last_opp"] = opp
 
             # Performance: do NOT write to DB or spam Discord for SKIP updates.
             # We only emit an "expired" message when an edge drops below the floor.
