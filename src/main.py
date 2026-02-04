@@ -762,12 +762,12 @@ async def main() -> None:
                             # Best-effort balance/allowance snapshot (for #executions visibility)
                             bal_summary = None
                             try:
-                                from py_clob_client.clob_types import BalanceAllowanceParams
+                                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
 
                                 client = executor._get_client()  # uses API creds; does NOT place orders
                                 params = BalanceAllowanceParams(
+                                    asset_type=AssetType.COLLATERAL,
                                     signature_type=int(getattr(executor, "signature_type", 0)),
-                                    funder=str(getattr(executor, "funder_address", "")),
                                 )
                                 try:
                                     await asyncio.to_thread(lambda: client.update_balance_allowance(params))

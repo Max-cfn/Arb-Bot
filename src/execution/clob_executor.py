@@ -251,9 +251,12 @@ class PolymarketClobExecutor:
         client = self._get_client()
 
         # Best-effort: fetch balance/allowance snapshot for debugging.
+        # In py-clob-client==0.34.5 BalanceAllowanceParams does NOT accept funder; funder is inferred from API creds.
         bal_info = None
         try:
-            params = BalanceAllowanceParams(signature_type=int(self.signature_type), funder=str(self.funder_address))
+            from py_clob_client.clob_types import AssetType
+
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=int(self.signature_type))
             # Some setups require an explicit refresh
             try:
                 await asyncio.to_thread(lambda: client.update_balance_allowance(params))
