@@ -717,10 +717,13 @@ async def main() -> None:
                     )
                     state["active"] = False
 
-            # Always emit DB log, but do NOT spam Discord with SKIP.
+            # Performance: do NOT write to DB or spam Discord for SKIP updates.
+            # We only emit an "expired" message when an edge drops below the floor.
+            if opp.verdict == "SKIP":
+                continue
+
             asyncio.create_task(db.log_opportunity(opp), name=f"db-opp-{opp.market_id}")
-            if opp.verdict != "SKIP":
-                asyncio.create_task(discord.send_opportunity(opp), name=f"alert-opp-{opp.market_id}")
+            asyncio.create_task(discord.send_opportunity(opp), name=f"alert-opp-{opp.market_id}")
 
             # --- AUTOMATION: ATTEMPT EXECUTION IMMEDIATELY ---
             # If killswitch is OFF, we keep scanning/alerting but do not emit execution/trading actions.
