@@ -68,19 +68,24 @@ def _format_time_left(end_date: str) -> str:
 def _format_plan_min_notional(opp: ArbitrageOpportunity, *, min_order_usd: float = 1.0) -> str:
     yes_p = float(getattr(opp, "yes_best_ask", 0.0) or 0.0)
     no_p = float(getattr(opp, "no_best_ask", 0.0) or 0.0)
-    cheaper = min(yes_p, no_p) if yes_p > 0 and no_p > 0 else max(yes_p, no_p)
 
-    shares = 1
-    if cheaper and cheaper > 0:
-        shares = max(1, int(math.ceil(min_order_usd / cheaper)))
+    # Requirement: min 5 shares each side AND min $1 notional on EACH leg
+    min_shares = 5
+    shares_yes_usd = int(math.ceil(min_order_usd / yes_p)) if yes_p > 0 else 0
+    shares_no_usd = int(math.ceil(min_order_usd / no_p)) if no_p > 0 else 0
+    shares = max(min_shares, shares_yes_usd, shares_no_usd)
 
-    total_cost = shares * (yes_p + no_p)
+    yes_notional = shares * yes_p
+    no_notional = shares * no_p
+    total_cost = yes_notional + no_notional
     est_profit = shares * float(getattr(opp, "one_share_net_profit", 0.0) or 0.0)
 
     return (
         f"YES ask: ${yes_p:.4f}\n"
         f"NO ask:  ${no_p:.4f}\n"
         f"Shares: {shares} YES + {shares} NO\n"
+        f"Notional YES: ${yes_notional:.4f}\n"
+        f"Notional NO:  ${no_notional:.4f}\n"
         f"Total cost: ${total_cost:.4f}\n"
         f"Net edge (per 1+1): {float(getattr(opp, 'one_share_net_edge_percent', 0.0) or 0.0):.2f}% "
         f"(profit ${float(getattr(opp, 'one_share_net_profit', 0.0) or 0.0):.4f})\n"
@@ -146,8 +151,13 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
                         "inline": True,
                     },
                     {
-                        "name": "Plan (min $1 notional)",
+                        "name": "Plan (min 5 shares + $1/leg)",
                         "value": _format_plan_min_notional(opp, min_order_usd=1.0),
+                        "inline": True,
+                    },
+                    {
+                        "name": "Market rank",
+                        "value": f"#{getattr(opp, 'market_rank_idx', 0)} of {getattr(opp, 'market_total_count', 0)}",
                         "inline": True,
                     },
                     {

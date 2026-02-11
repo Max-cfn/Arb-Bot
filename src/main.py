@@ -128,6 +128,10 @@ def select_markets(
 
     Aggressive OR filter: keep markets with liquidity>=min_liquidity_usd OR volume>=min_volume_usd.
     Then sort by volume descending (priority to activity) and take top max_markets.
+
+    Also annotates each selected market with rank metadata:
+    - market_rank_idx (1-based)
+    - market_total_count
     """
     filtered = [
         m for m in markets
@@ -139,7 +143,12 @@ def select_markets(
         key=lambda m: float(m.get("volume", 0) or 0),
         reverse=True,
     )
-    return filtered[:max_markets]
+    selected = filtered[:max_markets]
+    total = len(selected)
+    for i, m in enumerate(selected, start=1):
+        m["market_rank_idx"] = i
+        m["market_total_count"] = total
+    return selected
 
 
 async def periodic_market_refresh(
@@ -640,6 +649,14 @@ async def main() -> None:
                     continue
             except Exception:
                 continue
+
+            # Attach rank metadata from market selection (for opportunity embed)
+            try:
+                opp.market_rank_idx = int(market.get("market_rank_idx", 0) or 0)
+                opp.market_total_count = int(market.get("market_total_count", 0) or 0)
+            except Exception:
+                opp.market_rank_idx = 0
+                opp.market_total_count = 0
 
             # --- ALERT DEDUP (avoid spamming identical edges) ---
             # Only re-alert a market if the net edge changes by >= 0.001 percentage points.
