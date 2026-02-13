@@ -202,23 +202,51 @@ async def run_rust_hotpath(
 
     def on_execution(res) -> None:
         try:
+            import math
+
             mid = str(getattr(res, "market_id", ""))
             opp = last_opp_by_market.get(mid)
             if not opp:
                 return
+
+            status = str(getattr(res, "status", "FAILED"))
+            reason = str(getattr(res, "reason", ""))
+            reason_code = str(getattr(res, "reason_code", "") or "")
+
+            # Sizing plan used by Rust executor: min 5 shares and min $1 per leg.
+            yes_price = float(getattr(opp, "yes_best_ask", 0.0) or 0.0)
+            no_price = float(getattr(opp, "no_best_ask", 0.0) or 0.0)
+            min_order_usd = float(os.getenv("CLOB_MIN_ORDER_USD", "1.0"))
+            min_order_shares = float(os.getenv("CLOB_MIN_ORDER_SHARES", "5"))
+
+            shares_yes_usd = int(math.ceil(min_order_usd / yes_price)) if yes_price > 0 else 0
+            shares_no_usd = int(math.ceil(min_order_usd / no_price)) if no_price > 0 else 0
+            shares = int(max(5, math.ceil(min_order_shares), shares_yes_usd, shares_no_usd))
+
+            yes_qty = float(shares)
+            no_qty = float(shares)
+            yes_notional = yes_qty * yes_price
+            no_notional = no_qty * no_price
+            total_notional = yes_notional + no_notional
+
             note = (
-                f"rust_exec status={getattr(res, 'status', '')} | "
-                f"reason={getattr(res, 'reason', '')}\n"
-                f"sign_ms={float(getattr(res, 'sign_ms', 0.0) or 0.0):.2f} "
-                f"submit_ms={float(getattr(res, 'submit_ms', 0.0) or 0.0):.2f} "
-                f"total_ms={float(getattr(res, 'total_ms', 0.0) or 0.0):.2f}"
+                f"rust_exec status={status}"
+                f"{(' | reason_code=' + reason_code) if reason_code else ''}\n"
+                f"reason_detail={reason}\n"
+                f"durations_ms: sign={float(getattr(res, 'sign_ms', 0.0) or 0.0):.5f} | "
+                f"submit={float(getattr(res, 'submit_ms', 0.0) or 0.0):.5f} | "
+                f"total={float(getattr(res, 'total_ms', 0.0) or 0.0):.5f}\n"
+                f"buy_plan: YES_qty={yes_qty:.5f} @ ${yes_price:.5f} => ${yes_notional:.5f} | "
+                f"NO_qty={no_qty:.5f} @ ${no_price:.5f} => ${no_notional:.5f}\n"
+                f"sum_total=${total_notional:.5f} (constraints: min_shares>=5, min_notional_per_leg>=${min_order_usd:.2f})"
             )
+
             asyncio.run_coroutine_threadsafe(
                 discord.send_execution(
                     opp,
                     note=note,
                     run_id=str(getattr(res, "run_id", "")),
-                    status=str(getattr(res, "status", "FAILED")),
+                    status=status,
                 ),
                 loop,
             )
