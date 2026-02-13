@@ -1,0 +1,63 @@
+[package]
+name = "polymarket_engine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+name = "polymarket_engine"
+crate-type = ["cdylib"]
+
+[dependencies]
+# PyO3 - Python bindings
+pyo3 = { version = "0.24", features = ["extension-module"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+futures-util = "0.3"
+
+# HTTP client (h2 + connection pooling)
+reqwest = { version = "0.12", features = ["json", "native-tls", "gzip"] }
+
+# JSON (fast)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# EIP-712 types only (no alloy-signer-local to avoid broken alloy-consensus chain)
+alloy-primitives = "1"
+alloy-sol-types = "1"
+
+# Direct ECDSA signing (replaces alloy-signer-local)
+k256 = { version = "0.13", features = ["ecdsa"] }
+
+# HMAC for L2 auth headers
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
+# Crypto utils
+hex = "0.4"
+
+# Concurrency
+dashmap = "6"
+parking_lot = "0.12"
+
+# Time
+chrono = "0.4"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
