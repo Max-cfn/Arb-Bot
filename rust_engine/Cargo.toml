@@ -6,7 +6,7 @@ rust-version = "1.85"
 
 [lib]
 name = "polymarket_engine"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # PyO3 - Python bindings
