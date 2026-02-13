@@ -156,11 +156,9 @@ impl OrderbookManager {
     pub fn total_markets(&self) -> usize {
         self.markets.len()
     }
-}
 
     /// Alias: full book replacement (used by ws_client).
     pub fn update_full(&self, asset_id: &str, bids: Vec<Level>, asks: Vec<Level>) {
-        // Force full replacement by providing levels with non-zero sizes
         let mut sorted_bids = bids;
         let mut sorted_asks = asks;
         sorted_bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap());
@@ -177,3 +175,4 @@ impl OrderbookManager {
             },
         );
     }
+}
