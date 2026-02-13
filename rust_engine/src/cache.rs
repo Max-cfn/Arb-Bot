@@ -4,8 +4,7 @@
 use dashmap::DashMap;
 use reqwest::Client;
 use serde::Deserialize;
-use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::types::TokenMeta;
 
