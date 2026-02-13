@@ -180,8 +180,8 @@ impl FastExecutor {
         };
 
         // Build POST bodies
-        let yes_body = self.build_post_body(&yes_order, &yes_sig);
-        let no_body = self.build_post_body(&no_order, &no_sig);
+        let yes_body = self.build_post_body(&yes_order, &yes_sig, yes_tick, yes_neg_risk);
+        let no_body = self.build_post_body(&no_order, &no_sig, no_tick, no_neg_risk);
 
         // POST both in parallel
         let t_submit_start = Instant::now();
@@ -350,6 +350,8 @@ impl FastExecutor {
         &self,
         order: &Order,
         signature: &str,
+        tick_size: &str,
+        neg_risk: bool,
     ) -> serde_json::Value {
         serde_json::json!({
             "order": {
@@ -369,6 +371,8 @@ impl FastExecutor {
             },
             "owner": self.funder_address,
             "orderType": "GTC",
+            "tick_size": tick_size,
+            "neg_risk": neg_risk,
         })
     }
 
