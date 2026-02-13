@@ -74,6 +74,7 @@ pub struct RustArbOpportunity {
 pub struct RustExecutionResult {
     #[pyo3(get)] pub status: String,
     #[pyo3(get)] pub run_id: String,
+    #[pyo3(get)] pub market_id: String,
     #[pyo3(get)] pub yes_order_id: Option<String>,
     #[pyo3(get)] pub no_order_id: Option<String>,
     #[pyo3(get)] pub reason: String,

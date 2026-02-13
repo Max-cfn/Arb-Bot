@@ -169,13 +169,13 @@ impl FastExecutor {
         let yes_sig = match yes_sig_result {
             Ok(s) => s,
             Err(e) => {
-                return make_error_result(&run_id, &format!("YES sign failed: {e}"), sign_ms);
+                return make_error_result(&run_id, &opp.market_id, &format!("YES sign failed: {e}"), sign_ms);
             }
         };
         let no_sig = match no_sig_result {
             Ok(s) => s,
             Err(e) => {
-                return make_error_result(&run_id, &format!("NO sign failed: {e}"), sign_ms);
+                return make_error_result(&run_id, &opp.market_id, &format!("NO sign failed: {e}"), sign_ms);
             }
         };
 
@@ -239,6 +239,7 @@ impl FastExecutor {
         RustExecutionResult {
             status: status.to_string(),
             run_id,
+            market_id: opp.market_id.clone(),
             yes_order_id,
             no_order_id,
             reason,
@@ -444,10 +445,11 @@ fn round_to_tick(price: f64, tick_size: &str) -> f64 {
     (price / tick).round() * tick
 }
 
-fn make_error_result(run_id: &str, reason: &str, sign_ms: f64) -> RustExecutionResult {
+fn make_error_result(run_id: &str, market_id: &str, reason: &str, sign_ms: f64) -> RustExecutionResult {
     RustExecutionResult {
         status: "FAILED".to_string(),
         run_id: run_id.to_string(),
+        market_id: market_id.to_string(),
         yes_order_id: None,
         no_order_id: None,
         reason: reason.to_string(),

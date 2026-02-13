@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 import time
+import threading
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -52,6 +53,7 @@ except Exception:
 
 # Execution mode: dry-run (default) or real
 EXECUTION_MODE = os.getenv("EXECUTION_MODE", "dryrun").strip().lower()
+RUST_HOTPATH_ENABLED = os.getenv("RUST_HOTPATH_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 
 
@@ -93,6 +95,177 @@ def set_trading_enabled(enabled: bool) -> None:
     except Exception as exc:
         logger.error("Failed to write control file %s: %s", CONTROL_FILE, exc)
 
+
+async def run_rust_hotpath(
+    *,
+    discord: DiscordClient,
+    db: Database,
+    config,
+    markets: list[dict],
+) -> None:
+    """Run Rust WS + detection + submission in-process, keep Python alerting/DB.
+
+    Single-service mode: Python process stays the only systemd service.
+    """
+    from datetime import datetime, timezone
+    from src.detector.base import ArbitrageOpportunity
+
+    try:
+        from polymarket_engine import EngineConfig, HotPathEngine
+    except Exception as exc:
+        raise RuntimeError(f"Rust engine import failed (install extension first): {exc}")
+
+    loop = asyncio.get_running_loop()
+
+    market_rank: dict[str, tuple[int, int]] = {}
+    for m in markets:
+        mid = str(m.get("id") or "")
+        if not mid:
+            continue
+        market_rank[mid] = (
+            int(m.get("market_rank_idx", 0) or 0),
+            int(m.get("market_total_count", 0) or 0),
+        )
+
+    alert_last: dict[str, tuple[float, float]] = {}
+    last_opp_by_market: dict[str, ArbitrageOpportunity] = {}
+
+    def _to_py_opp(ropp) -> ArbitrageOpportunity:
+        opp = ArbitrageOpportunity(
+            market_id=str(getattr(ropp, "market_id", "")),
+            market_question=str(getattr(ropp, "market_question", "")),
+            yes_token_id=str(getattr(ropp, "yes_token_id", "")),
+            no_token_id=str(getattr(ropp, "no_token_id", "")),
+            condition_id=str(getattr(ropp, "condition_id", "")),
+            slug=str(getattr(ropp, "slug", "")),
+            end_date=str(getattr(ropp, "end_date", "")),
+            yes_best_ask=float(getattr(ropp, "yes_best_ask", 0.0) or 0.0),
+            no_best_ask=float(getattr(ropp, "no_best_ask", 0.0) or 0.0),
+            combined_best_asks=float(getattr(ropp, "combined_best_asks", 0.0) or 0.0),
+            one_share_net_profit=float(getattr(ropp, "one_share_net_profit", 0.0) or 0.0),
+            one_share_net_edge_percent=float(getattr(ropp, "one_share_net_edge_percent", 0.0) or 0.0),
+            yes_ask_vwap=float(getattr(ropp, "yes_ask_vwap", 0.0) or 0.0),
+            no_ask_vwap=float(getattr(ropp, "no_ask_vwap", 0.0) or 0.0),
+            combined_cost=float(getattr(ropp, "combined_cost", 0.0) or 0.0),
+            gross_edge=float(getattr(ropp, "gross_edge", 0.0) or 0.0),
+            gross_edge_percent=float(getattr(ropp, "gross_edge_percent", 0.0) or 0.0),
+            net_edge=float(getattr(ropp, "net_edge", 0.0) or 0.0),
+            net_edge_percent=float(getattr(ropp, "net_edge_percent", 0.0) or 0.0),
+            size_usd=float(getattr(ropp, "size_usd", 0.0) or 0.0),
+            yes_liquidity=float(getattr(ropp, "yes_liquidity", 0.0) or 0.0),
+            no_liquidity=float(getattr(ropp, "no_liquidity", 0.0) or 0.0),
+            max_safe_size=float(getattr(ropp, "max_safe_size", 0.0) or 0.0),
+            timestamp=datetime.now(timezone.utc),
+            is_crypto_15min=bool(getattr(ropp, "is_crypto_15min", False)),
+            verdict=str(getattr(ropp, "verdict", "SKIP")),
+            yes_book_age_s=float(getattr(ropp, "yes_book_age_s", 0.0) or 0.0),
+            no_book_age_s=float(getattr(ropp, "no_book_age_s", 0.0) or 0.0),
+        )
+        rank_idx, total = market_rank.get(opp.market_id, (0, 0))
+        opp.market_rank_idx = rank_idx
+        opp.market_total_count = total
+        return opp
+
+    def _passes_time_gates(opp: ArbitrageOpportunity) -> bool:
+        try:
+            end_raw = (opp.end_date or "").strip()
+            if not end_raw:
+                return False
+            end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            hours_left = (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+            if hours_left <= 0 or hours_left > 24:
+                return False
+            min_net = 2.0 if hours_left < 0.25 else (3.5 if hours_left < 4.0 else 5.0)
+            return bool(opp.net_edge_percent > min_net)
+        except Exception:
+            return False
+
+    def on_opportunity(ropp) -> None:
+        try:
+            opp = _to_py_opp(ropp)
+            if not _passes_time_gates(opp):
+                return
+
+            now_ts = time.time()
+            prev = alert_last.get(opp.market_id)
+            if prev is not None and abs(opp.net_edge_percent - prev[0]) < 0.001:
+                return
+            alert_last[opp.market_id] = (opp.net_edge_percent, now_ts)
+            last_opp_by_market[opp.market_id] = opp
+
+            asyncio.run_coroutine_threadsafe(db.log_opportunity(opp), loop)
+            asyncio.run_coroutine_threadsafe(discord.send_opportunity(opp), loop)
+        except Exception as exc:
+            logger.error("Rust on_opportunity callback failed: %s", exc)
+
+    def on_execution(res) -> None:
+        try:
+            mid = str(getattr(res, "market_id", ""))
+            opp = last_opp_by_market.get(mid)
+            if not opp:
+                return
+            note = (
+                f"rust_exec status={getattr(res, 'status', '')} | "
+                f"reason={getattr(res, 'reason', '')}\n"
+                f"sign_ms={float(getattr(res, 'sign_ms', 0.0) or 0.0):.2f} "
+                f"submit_ms={float(getattr(res, 'submit_ms', 0.0) or 0.0):.2f} "
+                f"total_ms={float(getattr(res, 'total_ms', 0.0) or 0.0):.2f}"
+            )
+            asyncio.run_coroutine_threadsafe(
+                discord.send_execution(
+                    opp,
+                    note=note,
+                    run_id=str(getattr(res, "run_id", "")),
+                    status=str(getattr(res, "status", "FAILED")),
+                ),
+                loop,
+            )
+        except Exception as exc:
+            logger.error("Rust on_execution callback failed: %s", exc)
+
+    def on_ws_event(kind, detail) -> None:
+        # Keep this quiet by default; only surface real WS errors.
+        try:
+            if str(kind) == "error" and str(detail).strip():
+                asyncio.run_coroutine_threadsafe(discord.send_ops(f"Rust WS error: {detail}"), loop)
+        except Exception:
+            pass
+
+    rcfg = EngineConfig()
+    rcfg.clob_base_url = os.getenv("CLOB_BASE_URL", "https://clob.polymarket.com")
+    rcfg.ws_url = os.getenv("WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market")
+    rcfg.private_key = os.getenv("CLOB_PRIVATE_KEY", "")
+    rcfg.funder_address = os.getenv("CLOB_FUNDER_ADDRESS", "")
+    rcfg.api_key = os.getenv("CLOB_API_KEY", "")
+    rcfg.api_secret = os.getenv("CLOB_API_SECRET", "")
+    rcfg.api_passphrase = os.getenv("CLOB_API_PASSPHRASE", "")
+    rcfg.chain_id = int(os.getenv("CLOB_CHAIN_ID", "137"))
+    rcfg.signature_type = int(os.getenv("CLOB_SIGNATURE_TYPE", "0"))
+    rcfg.min_edge_percent = float(config.min_edge_percent)
+    rcfg.min_liquidity_usd = float(config.min_liquidity_usd)
+    rcfg.buffer_liquid_percent = float(config.buffer_liquid_percent)
+    rcfg.buffer_illiquid_percent = float(config.buffer_illiquid_percent)
+    rcfg.illiquid_threshold_usd = float(config.illiquid_threshold_usd)
+    rcfg.target_size_usd = float(config.target_size_usd)
+    rcfg.cross_bps = float(os.getenv("CLOB_AGGRESSIVE_CROSS_BPS", "5"))
+    rcfg.min_order_usd = float(os.getenv("CLOB_MIN_ORDER_USD", "1.0"))
+    rcfg.min_order_shares = float(os.getenv("CLOB_MIN_ORDER_SHARES", "5"))
+
+    engine = HotPathEngine(rcfg, on_opportunity, on_execution, on_ws_event)
+    loaded = engine.load_markets(json.dumps(markets))
+    if loaded <= 0:
+        raise RuntimeError("Rust engine loaded 0 markets")
+
+    await discord.send_ops(f"Rust hotpath enabled in single-service mode: {loaded} markets")
+
+    t = threading.Thread(target=engine.start, daemon=True, name="rust-hotpath")
+    t.start()
+
+    # Keep coroutine alive forever; this task represents the hotpath lifecycle.
+    while True:
+        await asyncio.sleep(3600)
 
 
 async def periodic_health_check(
@@ -566,6 +739,53 @@ async def main() -> None:
         "Min edge": f"{config.min_edge_percent}%",
     })
 
+    if RUST_HOTPATH_ENABLED:
+        logger.info("Single-service mode: Rust hotpath enabled")
+
+        shutdown_event = asyncio.Event()
+
+        def _signal_handler() -> None:
+            logger.info("Shutdown signal received")
+            shutdown_event.set()
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _signal_handler)
+            except NotImplementedError:
+                pass
+
+        tasks = [
+            asyncio.create_task(periodic_6h_summary(discord, db), name="summary_6h"),
+            asyncio.create_task(daily_summary_task(discord, db, start_time), name="daily_summary"),
+            asyncio.create_task(periodic_db_purge(db), name="db_purge"),
+            asyncio.create_task(
+                run_rust_hotpath(
+                    discord=discord,
+                    db=db,
+                    config=config,
+                    markets=markets,
+                ),
+                name="rust_hotpath",
+            ),
+        ]
+
+        try:
+            shutdown_task = asyncio.create_task(shutdown_event.wait())
+            done, _ = await asyncio.wait([*tasks, shutdown_task], return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                if t != shutdown_task and t.exception():
+                    logger.error("Task %s failed: %s", t.get_name(), t.exception())
+                    await discord.send_ops(f"Task failed: {t.get_name()} :: {t.exception()}")
+        finally:
+            logger.info("Shutting down (rust single-service mode)...")
+            for t in tasks:
+                t.cancel()
+            await db.close()
+            await discord.send_health("Stopped", {"reason": "shutdown"})
+            logger.info("Bot stopped.")
+        return
+
     # --- Orderbook update callback ---
     last_ops_sample: float = 0.0
 
@@ -1014,7 +1234,7 @@ async def main() -> None:
         shutdown_task = asyncio.create_task(shutdown_event.wait())
         done, _ = await asyncio.wait(
             [*tasks, shutdown_task],
-            return_when=asyncio.FIRST_EXCEPTION,
+            return_when=asyncio.FIRST_COMPLETED,
         )
         for t in done:
             if t != shutdown_task and t.exception():
