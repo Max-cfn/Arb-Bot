@@ -192,24 +192,31 @@ impl FastExecutor {
         let submit_ms = t_submit_start.elapsed().as_secs_f64() * 1000.0;
         let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Extract order IDs from responses
+        // Extract order IDs + explicit post errors for rich execution reporting
+        let mut yes_post_err: Option<String> = None;
         let yes_order_id = match &yes_resp {
             Ok(v) => v.get("orderID")
                 .or_else(|| v.get("id"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
             Err(e) => {
-                error!("YES POST failed: {}", e);
+                let msg = e.to_string();
+                error!("YES POST failed: {}", msg);
+                yes_post_err = Some(msg);
                 None
             }
         };
+
+        let mut no_post_err: Option<String> = None;
         let no_order_id = match &no_resp {
             Ok(v) => v.get("orderID")
                 .or_else(|| v.get("id"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
             Err(e) => {
-                error!("NO POST failed: {}", e);
+                let msg = e.to_string();
+                error!("NO POST failed: {}", msg);
+                no_post_err = Some(msg);
                 None
             }
         };
@@ -223,9 +230,11 @@ impl FastExecutor {
         };
 
         let reason = format!(
-            "yes={} no={} sign={:.1}ms submit={:.1}ms total={:.1}ms",
+            "yes={} no={} yes_err={} no_err={} sign={:.5}ms submit={:.5}ms total={:.5}ms",
             yes_order_id.as_deref().unwrap_or("NONE"),
             no_order_id.as_deref().unwrap_or("NONE"),
+            yes_post_err.as_deref().unwrap_or("none"),
+            no_post_err.as_deref().unwrap_or("none"),
             sign_ms,
             submit_ms,
             total_ms,
@@ -236,6 +245,14 @@ impl FastExecutor {
             status, run_id, reason
         );
 
+        let reason_code = if status == "SUBMITTED" {
+            None
+        } else if status == "PARTIAL_SUBMIT" {
+            Some("PARTIAL_POST_FAILED".to_string())
+        } else {
+            Some("POST_FAILED".to_string())
+        };
+
         RustExecutionResult {
             status: status.to_string(),
             run_id,
@@ -243,7 +260,7 @@ impl FastExecutor {
             yes_order_id,
             no_order_id,
             reason,
-            reason_code: None,
+            reason_code,
             yes_filled_size: 0.0,
             no_filled_size: 0.0,
             sign_ms,
