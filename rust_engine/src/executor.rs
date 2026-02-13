@@ -389,15 +389,16 @@ impl FastExecutor {
 
         let hmac_sig = self.compute_hmac(&timestamp, "POST", path, &body_str)?;
 
+        let poly_address = format!("{}", self.signer_address);
         let resp = self
             .http
             .post(&url)
             .header("Content-Type", "application/json")
-            .header("POLY-ADDRESS", &self.funder_address)
-            .header("POLY-SIGNATURE", &hmac_sig)
-            .header("POLY-TIMESTAMP", &timestamp)
-            .header("POLY-API-KEY", &self.api_key)
-            .header("POLY-PASSPHRASE", &self.api_passphrase)
+            .header("POLY_ADDRESS", &poly_address)
+            .header("POLY_SIGNATURE", &hmac_sig)
+            .header("POLY_TIMESTAMP", &timestamp)
+            .header("POLY_API_KEY", &self.api_key)
+            .header("POLY_PASSPHRASE", &self.api_passphrase)
             .body(body_str)
             .send()
             .await
@@ -419,7 +420,7 @@ impl FastExecutor {
     }
 
     /// Compute HMAC-SHA256 L2 auth signature.
-    /// Message format: timestamp + "\n" + method + "\n" + path + "\n" + body
+    /// Message format: timestamp + method + path + body (plain concatenation, no separators)
     fn compute_hmac(
         &self,
         timestamp: &str,
@@ -427,18 +428,18 @@ impl FastExecutor {
         path: &str,
         body: &str,
     ) -> Result<String> {
-        let secret_bytes = base64::engine::general_purpose::STANDARD
+        let secret_bytes = base64::engine::general_purpose::URL_SAFE
             .decode(&self.api_secret)
             .context("Failed to base64-decode api_secret")?;
 
-        let message = format!("{}\n{}\n{}\n{}", timestamp, method, path, body);
+        let message = format!("{}{}{}{}", timestamp, method, path, body);
 
         let mut mac = Hmac::<Sha256>::new_from_slice(&secret_bytes)
             .map_err(|e| anyhow!("HMAC key error: {e}"))?;
         mac.update(message.as_bytes());
         let result = mac.finalize().into_bytes();
 
-        Ok(base64::engine::general_purpose::STANDARD.encode(result))
+        Ok(base64::engine::general_purpose::URL_SAFE.encode(result))
     }
 }
 
