@@ -1,29 +1,75 @@
-# Polymarket Arbitrage Bot
+# Polymarket Arb-Bot (Single Service + Rust Hotpath)
 
-Binary arbitrage detection bot for Polymarket. Phase 1: alerting only (no auto-execution).
+Polymarket binary arbitrage bot with:
+- **single systemd service** (`polymarket-bot`)
+- **Rust hotpath** for WS market stream, detection, and order submission
+- **Python control plane** for config loading, Discord alerting, DB logging, summaries, and ops
 
-Scans orderbooks via WebSocket, detects when YES + NO asks sum to less than $1 (after fees), and sends Discord alerts.
+> Current production model: **one service only**. `polymarket-rust` standalone unit is not used.
 
-## Architecture
+---
 
+## Current Architecture
+
+```text
+systemd: polymarket-bot (python -m src.main)
+  ├─ Python (control plane)
+  │   ├─ load .env / validate config
+  │   ├─ fetch & rank markets (Gamma)
+  │   ├─ Discord alerts (opportunities + executions + ops + health)
+  │   ├─ SQLite logging / summaries
+  │   └─ lifecycle / shutdown
+  │
+  └─ Rust (hotpath, embedded via PyO3 module: polymarket_engine)
+      ├─ WS subscriptions (CLOB)
+      ├─ orderbook updates
+      ├─ binary arb detection
+      └─ 2-leg submission (YES+NO) with HMAC auth
 ```
-Scanner (WebSocket) --> Detector (VWAP + Fees) --> Discord Alerts
-       |                       |                        |
-  Orderbook Manager      Arb Engine              SQLite Logs
-```
 
-## Quick Start
+### Why this split
+- Keep **latency-sensitive** path in Rust.
+- Keep **business + alerting + observability** in Python.
+- Keep operations simple: one process, one service.
 
-### 1. Install
+---
 
+## Important Runtime Behavior
+
+- `RUST_HOTPATH_ENABLED=1` (default) => Rust detection/execution pipeline is used inside Python service.
+- Alerts are still sent from Python Discord client.
+- Opportunity alert plan enforces:
+  - minimum **5 shares per leg**
+  - minimum **$1 notional per leg**
+- Opportunity embeds include market rank (`#X of Y`).
+- Execution embeds now include:
+  - status + reason details
+  - reason_code (`POST_FAILED`, `PARTIAL_POST_FAILED`, ...)
+  - timing in ms with 5 decimals
+  - YES/NO quantities + notionals + total sum
+
+---
+
+## Service Management
+
+### Main service
 ```bash
-# Clone and setup
-git clone <repo-url> && cd polymarket-arb-bot
-chmod +x setup.sh && ./setup.sh
+sudo systemctl status polymarket-bot
+sudo systemctl restart polymarket-bot
+journalctl -u polymarket-bot -f
 ```
 
-Or manually:
+### Rust standalone service (should stay disabled)
+```bash
+sudo systemctl status polymarket-rust
+# expected in current architecture: inactive/disabled
+```
 
+---
+
+## Setup
+
+## 1) Python env
 ```bash
 python3.12 -m venv venv
 source venv/bin/activate
@@ -32,106 +78,172 @@ mkdir -p data logs
 cp .env.example .env
 ```
 
-### 2. Configure
+## 2) Rust toolchain + PyO3 wheel
+```bash
+# rustup + cargo installed
+cd rust_engine
+# build wheel for local venv python
+PATH=/opt/polymarket-bot/Arb-Bot/venv/bin:$PATH \
+  /opt/polymarket-bot/Arb-Bot/venv/bin/maturin build --release -i /opt/polymarket-bot/Arb-Bot/venv/bin/python
 
-Edit `.env` with your Discord webhook URLs:
-
-```env
-DISCORD_WEBHOOK_HEALTH=https://discord.com/api/webhooks/...
-DISCORD_WEBHOOK_OPS=https://discord.com/api/webhooks/...
-DISCORD_WEBHOOK_DAILY=https://discord.com/api/webhooks/...
-DISCORD_WEBHOOK_OPPORTUNITIES=https://discord.com/api/webhooks/...
+/opt/polymarket-bot/Arb-Bot/venv/bin/pip install --force-reinstall target/wheels/polymarket_engine-*.whl
 ```
 
-### 3. Verify
+---
 
+## Critical `.env` Keys
+
+### Trading / CLOB auth
+- `CLOB_PRIVATE_KEY`
+- `CLOB_FUNDER_ADDRESS`
+- `CLOB_API_KEY`
+- `CLOB_API_SECRET`
+- `CLOB_API_PASSPHRASE`
+
+### Execution sizing
+- `CLOB_MIN_ORDER_USD` (default 1.0)
+- `CLOB_MIN_ORDER_SHARES` (default 5)
+- `CLOB_AGGRESSIVE_CROSS_BPS` (default 5)
+
+### Strategy / filters
+- `MIN_EDGE_PERCENT`
+- `MIN_LIQUIDITY_USD`
+- `MAX_MARKETS_WATCH`
+- `MARKET_MIN_LIQUIDITY_USD`
+- `MARKET_MIN_VOLUME_USD`
+- `BUFFER_LIQUID_PERCENT`
+- `BUFFER_ILLIQUID_PERCENT`
+- `ILLIQUID_THRESHOLD_USD`
+- `TARGET_SIZE_USD`
+
+### Runtime mode
+- `EXECUTION_MODE` (`dryrun` or `real`)
+- `RUST_HOTPATH_ENABLED` (`1`/`0`)
+
+---
+
+## CLOB API Secret Format (very important)
+
+`CLOB_API_SECRET` must be valid data for Rust HMAC decode.
+
+- Rust currently decodes with **standard base64 decoder**.
+- If your secret is url-safe base64 (`-` and `_`), execution can fail with:
+  `Failed to base64-decode api_secret`
+
+### Quick check
 ```bash
 source venv/bin/activate
-python scripts/check_geoblock.py    # Must NOT be blocked
-python scripts/test_discord.py      # Test webhook delivery
-python scripts/list_markets.py      # List active markets
+python - <<'PY'
+from dotenv import load_dotenv
+import os, base64, binascii
+load_dotenv('/opt/polymarket-bot/Arb-Bot/.env', override=True)
+s=os.getenv('CLOB_API_SECRET','').strip()
+try:
+    base64.b64decode(s, validate=True)
+    print('OK_BASE64')
+except binascii.Error:
+    print('INVALID_BASE64')
+PY
 ```
 
-### 4. Run
+### If needed: convert base64url -> base64 standard
+```bash
+source venv/bin/activate
+python - <<'PY'
+from dotenv import dotenv_values
+from pathlib import Path
+import base64
+
+p = Path('/opt/polymarket-bot/Arb-Bot/.env')
+vals = dotenv_values(p)
+s = (vals.get('CLOB_API_SECRET') or '').strip()
+raw = base64.urlsafe_b64decode(s)
+fixed = base64.b64encode(raw).decode()
+text = p.read_text()
+text = text.replace(f"CLOB_API_SECRET={s}", f"CLOB_API_SECRET={fixed}")
+p.write_text(text)
+print('normalized')
+PY
+```
+
+---
+
+## Generate CLOB API creds (from current wallet)
 
 ```bash
-# Development
-python -m src.main
+cd /opt/polymarket-bot/Arb-Bot
+source venv/bin/activate
 
-# Production (systemd)
-sudo cp systemd/polymarket-bot.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now polymarket-bot
-sudo journalctl -u polymarket-bot -f
+python - <<'PY'
+import os
+from dotenv import load_dotenv
+from py_clob_client.client import ClobClient
+
+load_dotenv('/opt/polymarket-bot/Arb-Bot/.env', override=True)
+
+c = ClobClient(
+    os.getenv('CLOB_BASE_URL','https://clob.polymarket.com'),
+    key=os.getenv('CLOB_PRIVATE_KEY'),
+    chain_id=int(os.getenv('CLOB_CHAIN_ID','137')),
+    signature_type=int(os.getenv('CLOB_SIGNATURE_TYPE','0')),
+    funder=os.getenv('CLOB_FUNDER_ADDRESS'),
+)
+creds = c.create_or_derive_api_creds()
+print('CLOB_API_KEY=' + creds.api_key)
+print('CLOB_API_SECRET=' + creds.api_secret)
+print('CLOB_API_PASSPHRASE=' + creds.api_passphrase)
+PY
 ```
 
-## Detection Logic
+Then update `.env` and restart service.
 
-**Binary arbitrage**: buy YES + NO shares. If their combined ask price is below $1 after fees and buffer, there is a guaranteed profit at resolution.
+---
 
-```
-Edge = 1.0 - (VWAP_YES_ask + VWAP_NO_ask)
-Net  = Edge - resolution_fee(2%) - trading_fee - safety_buffer
-```
+## Wallet switch playbook
 
-The bot uses VWAP (Volume-Weighted Average Price) across orderbook depth, not just best ask.
+If you change trading wallet, update and regenerate all wallet-bound auth:
+1. `CLOB_PRIVATE_KEY`
+2. `CLOB_FUNDER_ADDRESS`
+3. regenerate `CLOB_API_KEY` / `CLOB_API_SECRET` / `CLOB_API_PASSPHRASE`
+4. restart `polymarket-bot`
 
-## Discord Channels
+---
 
-| Webhook | Purpose | Frequency |
-|---------|---------|-----------|
-| HEALTH | Heartbeat + stats | Every 5 min |
-| OPS | Errors, reconnections | On event |
-| DAILY | 24h summary | 08:00 UTC |
-| OPPORTUNITIES | Arbitrage alerts | Real-time |
+## Project Structure (current)
 
-## Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MIN_EDGE_PERCENT` | 0.5 | Minimum net edge to alert (%) |
-| `MIN_LIQUIDITY_USD` | 100 | Minimum liquidity per side ($) |
-| `MAX_MARKETS_WATCH` | 500 | Max markets to scan |
-| `BUFFER_LIQUID_PERCENT` | 0.5 | Safety buffer for liquid markets |
-| `BUFFER_ILLIQUID_PERCENT` | 1.0 | Safety buffer for illiquid markets |
-| `ILLIQUID_THRESHOLD_USD` | 1000 | Threshold to classify as illiquid |
-
-## Tests
-
-```bash
-pytest tests/ -v
-```
-
-## Project Structure
-
-```
+```text
 src/
-  main.py                  # Entry point (asyncio)
-  config.py                # .env loader + validation
-  scanner/
-    websocket_client.py    # Real-time orderbook via WebSocket
-    market_fetcher.py      # REST API market list
-    orderbook_manager.py   # In-memory orderbook state
-  detector/
-    vwap.py                # VWAP calculation
-    fees.py                # Fee calculation
-    binary_arb.py          # Binary arbitrage detector
-    multi_outcome_arb.py   # Multi-outcome (stub, Phase 2)
+  main.py                  # entrypoint, single-service orchestration
+  config.py                # .env loading + validation
+  scanner/                 # legacy python scanner path (fallback / non-rust mode)
+  detector/                # python types + detector components
+  execution/               # python execution path (legacy / fallback)
   alerts/
-    discord.py             # Webhook client
-    formatters.py          # Embed formatting
+    discord.py             # discord webhook client
+    formatters.py          # embeds (opportunity/execution/ops/health)
   storage/
-    db.py                  # SQLite opportunity logs
+    db.py                  # sqlite logging
   utils/
-    logger.py              # Rotating file + console logging
-    geoblock.py            # IP geoblock check
-scripts/                   # Utility scripts
-tests/                     # Unit tests
-systemd/                   # Service file for 24/7 operation
+    logger.py
+    geoblock.py
+
+rust_engine/
+  src/lib.rs               # PyO3 module entrypoint (HotPathEngine)
+  src/ws_client.rs         # WS stream + reconnects
+  src/orderbook.rs         # in-memory books
+  src/detector.rs          # arb detection logic
+  src/executor.rs          # EIP-712 + CLOB POST submit
+  src/cache.rs             # token metadata cache
+  src/types.rs             # shared rust<->python types
+
+systemd/
+  polymarket-bot.service   # production unit (single service)
 ```
 
-## Requirements
+---
 
-- Python 3.12+
-- VM with non-blocked IP (e.g. Amsterdam)
-- Discord server with webhook URLs
+## Notes
+
+- This repo has evolved from alert-only into real execution architecture.
+- For production, always verify `journalctl` after deploys.
+- If execution fails, first inspect `reason_code` + `reason_detail` in execution channel and service logs.
