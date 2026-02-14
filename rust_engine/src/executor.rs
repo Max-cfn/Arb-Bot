@@ -1,7 +1,9 @@
 //! EIP-712 signing and HTTP order submission to the Polymarket CLOB.
 //!
-//! Builds two CLOB orders (YES buy + NO buy), signs both via EIP-712,
-//! and POSTs them in parallel for minimum latency.
+//! Three-phase execution with complete-or-abort safety:
+//!   Phase 1 — Sign + POST both legs in parallel (hot path, ~50ms)
+//!   Phase 2 — Poll for fills (up to 500ms)
+//!   Phase 3 — Recovery: cancel open → retry failed leg → unwind if needed
 //!
 //! Uses k256 directly for ECDSA signing (avoids alloy-signer-local and its
 //! broken alloy-consensus transitive dependency chain).
@@ -17,7 +19,8 @@ use hmac::{Hmac, Mac};
 use k256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
 use reqwest::Client;
 use sha2::Sha256;
-use tracing::{error, info};
+use tokio::time::{sleep, Duration};
+use tracing::{error, info, warn};
 
 use crate::cache::MetaCache;
 use crate::types::{EngineConfig, RustArbOpportunity, RustExecutionResult};
@@ -28,6 +31,9 @@ use crate::types::{EngineConfig, RustArbOpportunity, RustExecutionResult};
 
 const EXCHANGE_ADDRESS: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
 const NEG_RISK_EXCHANGE_ADDRESS: &str = "0xC5d563A36AE78145C45a50134d48A1215220f80a";
+
+const BUY: u8 = 0;
+const SELL: u8 = 1;
 
 // ---------------------------------------------------------------------------
 // EIP-712 typed data definition (via alloy sol! macro)
@@ -112,7 +118,10 @@ impl FastExecutor {
         })
     }
 
-    /// Execute a two-leg binary arb: sign + POST both orders in parallel.
+    // =====================================================================
+    // Main execution: 3-phase complete-or-abort
+    // =====================================================================
+
     pub async fn execute(
         &self,
         opp: &RustArbOpportunity,
@@ -122,7 +131,9 @@ impl FastExecutor {
         let t_start = Instant::now();
         let run_id = format!("R{:x}", rand_u64());
 
-        // Determine tick_size, neg_risk, and fee_rate from cache
+        // -----------------------------------------------------------------
+        // Resolve market metadata
+        // -----------------------------------------------------------------
         let yes_meta = meta_cache.get(&opp.yes_token_id);
         let no_meta = meta_cache.get(&opp.no_token_id);
         let yes_neg_risk = yes_meta.as_ref().map(|m| m.neg_risk).unwrap_or(false);
@@ -147,124 +158,286 @@ impl FastExecutor {
         let shares = shares_for_min_notional.max(shares_floor);
 
         // Round prices to tick_size
-        let yes_price_rounded = round_to_tick(yes_limit, yes_tick);
-        let no_price_rounded = round_to_tick(no_limit, no_tick);
+        let yes_price = round_to_tick(yes_limit, yes_tick);
+        let no_price = round_to_tick(no_limit, no_tick);
 
-        // Build EIP-712 orders
-        let yes_order = self.build_order(
-            &opp.yes_token_id,
-            yes_price_rounded,
-            shares as f64,
-            yes_fee_bps,
-        );
-        let no_order = self.build_order(
-            &opp.no_token_id,
-            no_price_rounded,
-            shares as f64,
-            no_fee_bps,
-        );
+        // =================================================================
+        // PHASE 1: Build → Sign → POST  (hot path)
+        // =================================================================
 
-        // Sign both (synchronous ECDSA, very fast — <1ms each)
+        let yes_order = self.build_order(&opp.yes_token_id, yes_price, shares as f64, yes_fee_bps, BUY);
+        let no_order = self.build_order(&opp.no_token_id, no_price, shares as f64, no_fee_bps, BUY);
+
         let t_sign_start = Instant::now();
-        let yes_sig_result = self.sign_order(&yes_order, yes_neg_risk);
-        let no_sig_result = self.sign_order(&no_order, no_neg_risk);
+        let yes_sig = match self.sign_order(&yes_order, yes_neg_risk) {
+            Ok(s) => s,
+            Err(e) => {
+                return make_error_result(&run_id, &opp.market_id, &format!("YES sign failed: {e}"), t_sign_start.elapsed().as_secs_f64() * 1000.0);
+            }
+        };
+        let no_sig = match self.sign_order(&no_order, no_neg_risk) {
+            Ok(s) => s,
+            Err(e) => {
+                return make_error_result(&run_id, &opp.market_id, &format!("NO sign failed: {e}"), t_sign_start.elapsed().as_secs_f64() * 1000.0);
+            }
+        };
         let sign_ms = t_sign_start.elapsed().as_secs_f64() * 1000.0;
 
-        let yes_sig = match yes_sig_result {
-            Ok(s) => s,
-            Err(e) => {
-                return make_error_result(&run_id, &opp.market_id, &format!("YES sign failed: {e}"), sign_ms);
-            }
-        };
-        let no_sig = match no_sig_result {
-            Ok(s) => s,
-            Err(e) => {
-                return make_error_result(&run_id, &opp.market_id, &format!("NO sign failed: {e}"), sign_ms);
-            }
-        };
+        let yes_body = self.build_post_body(&yes_order, &yes_sig, "GTC");
+        let no_body = self.build_post_body(&no_order, &no_sig, "GTC");
 
-        // Build POST bodies
-        let yes_body = self.build_post_body(&yes_order, &yes_sig);
-        let no_body = self.build_post_body(&no_order, &no_sig);
-
-        // POST both in parallel
-        let t_submit_start = Instant::now();
+        let t_submit = Instant::now();
         let (yes_resp, no_resp) = tokio::join!(
             self.post_order(&yes_body),
             self.post_order(&no_body),
         );
-        let submit_ms = t_submit_start.elapsed().as_secs_f64() * 1000.0;
-        let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+        let submit_ms = t_submit.elapsed().as_secs_f64() * 1000.0;
 
-        // Extract order IDs + explicit post errors for rich execution reporting
-        let mut yes_post_err: Option<String> = None;
         let yes_order_id = match &yes_resp {
-            Ok(v) => v.get("orderID")
-                .or_else(|| v.get("id"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            Err(e) => {
-                let msg = e.to_string();
-                error!("YES POST failed: {}", msg);
-                yes_post_err = Some(msg);
-                None
-            }
+            Ok(v) => extract_order_id(v),
+            Err(e) => { error!("YES POST failed: {}", e); None }
         };
-
-        let mut no_post_err: Option<String> = None;
         let no_order_id = match &no_resp {
-            Ok(v) => v.get("orderID")
-                .or_else(|| v.get("id"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            Err(e) => {
-                let msg = e.to_string();
-                error!("NO POST failed: {}", msg);
-                no_post_err = Some(msg);
-                None
+            Ok(v) => extract_order_id(v),
+            Err(e) => { error!("NO POST failed: {}", e); None }
+        };
+
+        // ----- Both POSTs failed -----
+        if yes_order_id.is_none() && no_order_id.is_none() {
+            let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+            return RustExecutionResult {
+                status: "FAILED".into(),
+                run_id,
+                market_id: opp.market_id.clone(),
+                yes_order_id: None,
+                no_order_id: None,
+                reason: format!(
+                    "both POSTs failed yes_err={} no_err={}",
+                    yes_resp.err().map(|e| e.to_string()).unwrap_or_default(),
+                    no_resp.err().map(|e| e.to_string()).unwrap_or_default(),
+                ),
+                reason_code: Some("POST_FAILED".into()),
+                yes_filled_size: 0.0,
+                no_filled_size: 0.0,
+                sign_ms,
+                submit_ms,
+                total_ms,
+            };
+        }
+
+        // ----- One POST failed: cancel the surviving order immediately -----
+        if yes_order_id.is_none() || no_order_id.is_none() {
+            let surviving = yes_order_id.as_deref().or(no_order_id.as_deref()).unwrap();
+            info!("executor: partial POST, cancelling surviving order {}", surviving);
+            let _ = self.cancel_orders(&[surviving]).await;
+            let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+            return RustExecutionResult {
+                status: "CANCELLED".into(),
+                run_id,
+                market_id: opp.market_id.clone(),
+                yes_order_id: yes_order_id.clone(),
+                no_order_id: no_order_id.clone(),
+                reason: "one POST failed, cancelled surviving order".into(),
+                reason_code: Some("PARTIAL_POST_CANCELLED".into()),
+                yes_filled_size: 0.0,
+                no_filled_size: 0.0,
+                sign_ms,
+                submit_ms,
+                total_ms,
+            };
+        }
+
+        // From here: both order IDs are present
+        let yes_oid = yes_order_id.as_ref().unwrap().clone();
+        let no_oid = no_order_id.as_ref().unwrap().clone();
+
+        // =================================================================
+        // PHASE 2: Wait for both fills  (up to wait_for_both_ms)
+        // =================================================================
+
+        let poll_interval = Duration::from_millis(config.poll_interval_ms);
+        let wait_deadline = Instant::now() + Duration::from_millis(config.wait_for_both_ms);
+
+        let mut yes_filled = 0.0_f64;
+        let mut no_filled = 0.0_f64;
+        let mut yes_done = false;
+        let mut no_done = false;
+
+        while Instant::now() < wait_deadline {
+            let (ys, ns) = tokio::join!(
+                self.get_order_status(&yes_oid),
+                self.get_order_status(&no_oid),
+            );
+            if let Some((st, sz)) = ys { yes_done = is_done(&st); yes_filled = sz; }
+            if let Some((st, sz)) = ns { no_done = is_done(&st); no_filled = sz; }
+
+            // Both legs filled → success, fast return
+            if yes_filled > 0.0 && no_filled > 0.0 && yes_done && no_done {
+                let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+                info!("executor: FILLED run={} yes={:.2} no={:.2} total={:.1}ms", run_id, yes_filled, no_filled, total_ms);
+                return RustExecutionResult {
+                    status: "FILLED".into(),
+                    run_id,
+                    market_id: opp.market_id.clone(),
+                    yes_order_id: Some(yes_oid),
+                    no_order_id: Some(no_oid),
+                    reason: format!("BOTH_FILLED yes={:.4} no={:.4}", yes_filled, no_filled),
+                    reason_code: Some("BOTH_FILLED".into()),
+                    yes_filled_size: yes_filled,
+                    no_filled_size: no_filled,
+                    sign_ms,
+                    submit_ms,
+                    total_ms,
+                };
             }
-        };
 
-        let status = if yes_order_id.is_some() && no_order_id.is_some() {
-            "SUBMITTED"
-        } else if yes_order_id.is_some() || no_order_id.is_some() {
-            "PARTIAL_SUBMIT"
-        } else {
-            "FAILED"
-        };
+            // Both orders reached terminal state but not both filled — skip to recovery
+            if yes_done && no_done { break; }
 
-        let reason = format!(
-            "yes={} no={} yes_err={} no_err={} sign={:.5}ms submit={:.5}ms total={:.5}ms",
-            yes_order_id.as_deref().unwrap_or("NONE"),
-            no_order_id.as_deref().unwrap_or("NONE"),
-            yes_post_err.as_deref().unwrap_or("none"),
-            no_post_err.as_deref().unwrap_or("none"),
-            sign_ms,
-            submit_ms,
-            total_ms,
-        );
+            sleep(poll_interval).await;
+        }
 
-        info!(
-            "executor: {} run={} {}",
-            status, run_id, reason
-        );
+        // =================================================================
+        // PHASE 3: Recovery — cancel, retry, or unwind
+        // =================================================================
 
-        let reason_code = if status == "SUBMITTED" {
-            None
-        } else if status == "PARTIAL_SUBMIT" {
-            Some("PARTIAL_POST_FAILED".to_string())
-        } else {
-            Some("POST_FAILED".to_string())
-        };
+        // 3a: Cancel any orders still open
+        {
+            let mut to_cancel = Vec::new();
+            if !yes_done { to_cancel.push(yes_oid.as_str()); }
+            if !no_done { to_cancel.push(no_oid.as_str()); }
+            if !to_cancel.is_empty() {
+                info!("executor: cancelling {} open order(s) run={}", to_cancel.len(), run_id);
+                if let Err(e) = self.cancel_orders(&to_cancel).await {
+                    warn!("executor: cancel_orders error: {} run={}", e, run_id);
+                }
+            }
+        }
 
+        // 3b: Post-cancel re-check (50ms settle, then refresh statuses)
+        sleep(Duration::from_millis(50)).await;
+        {
+            let (ys, ns) = tokio::join!(
+                self.get_order_status(&yes_oid),
+                self.get_order_status(&no_oid),
+            );
+            if let Some((_st, sz)) = ys { yes_filled = sz; }
+            if let Some((_st, sz)) = ns { no_filled = sz; }
+        }
+
+        // ----- Case A: Both legs have fills (possibly mismatched) -----
+        if yes_filled > 0.0 && no_filled > 0.0 {
+            let diff = yes_filled - no_filled;
+            if diff.abs() > 0.001 {
+                if diff > 0.0 {
+                    info!("executor: trimming excess YES {:.4} run={}", diff, run_id);
+                    let _ = self.unwind_sell(&opp.yes_token_id, diff, yes_price, yes_neg_risk, yes_fee_bps, yes_tick, config.unwind_max_loss_pct).await;
+                } else {
+                    info!("executor: trimming excess NO {:.4} run={}", -diff, run_id);
+                    let _ = self.unwind_sell(&opp.no_token_id, -diff, no_price, no_neg_risk, no_fee_bps, no_tick, config.unwind_max_loss_pct).await;
+                }
+            }
+            let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+            info!("executor: FILLED(recovery) run={} yes={:.2} no={:.2} total={:.1}ms", run_id, yes_filled, no_filled, total_ms);
+            return RustExecutionResult {
+                status: "FILLED".into(),
+                run_id,
+                market_id: opp.market_id.clone(),
+                yes_order_id: Some(yes_oid),
+                no_order_id: Some(no_oid),
+                reason: format!("RECOVERY_BOTH_FILLED yes={:.4} no={:.4}", yes_filled, no_filled),
+                reason_code: Some("RECOVERY_BOTH_FILLED".into()),
+                yes_filled_size: yes_filled,
+                no_filled_size: no_filled,
+                sign_ms,
+                submit_ms,
+                total_ms,
+            };
+        }
+
+        // ----- Case B: One-sided fill → retry other leg, then unwind if retry fails -----
+        if (yes_filled > 0.0) != (no_filled > 0.0) {
+            let (filled_label, filled_token, filled_size, filled_price, filled_neg_risk, filled_fee_bps, filled_tick,
+                 other_token, other_price, other_neg_risk, other_fee_bps, other_tick) =
+                if yes_filled > 0.0 {
+                    ("YES", &opp.yes_token_id, yes_filled, yes_price,
+                     yes_neg_risk, yes_fee_bps, yes_tick,
+                     &opp.no_token_id, no_price, no_neg_risk, no_fee_bps, no_tick)
+                } else {
+                    ("NO", &opp.no_token_id, no_filled, no_price,
+                     no_neg_risk, no_fee_bps, no_tick,
+                     &opp.yes_token_id, yes_price, yes_neg_risk, yes_fee_bps, yes_tick)
+                };
+
+            info!("executor: one-sided fill {}={:.4}, retrying other leg run={}", filled_label, filled_size, run_id);
+
+            // Retry: buy the other leg with slippage, FAK order type
+            let retry_price = round_to_tick(
+                (other_price * (1.0 + config.retry_slippage_pct / 100.0)).min(0.9999).max(0.0001),
+                other_tick,
+            );
+            let retry_ok = self.retry_buy(
+                other_token, retry_price, filled_size, other_fee_bps,
+                other_neg_risk, poll_interval, config.retry_duration_ms, &run_id,
+            ).await;
+
+            if retry_ok {
+                let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+                info!("executor: FILLED(retry) run={} total={:.1}ms", run_id, total_ms);
+                return RustExecutionResult {
+                    status: "FILLED".into(),
+                    run_id,
+                    market_id: opp.market_id.clone(),
+                    yes_order_id: Some(yes_oid),
+                    no_order_id: Some(no_oid),
+                    reason: format!("PARTIAL_RETRY_SUCCESS {}_filled={:.4}", filled_label, filled_size),
+                    reason_code: Some("PARTIAL_RETRY_SUCCESS".into()),
+                    yes_filled_size: if yes_filled > 0.0 { yes_filled } else { filled_size },
+                    no_filled_size: if no_filled > 0.0 { no_filled } else { filled_size },
+                    sign_ms,
+                    submit_ms,
+                    total_ms,
+                };
+            }
+
+            // Retry failed → unwind the filled leg
+            warn!("executor: retry failed, unwinding {} run={}", filled_label, run_id);
+            let unwind_ok = self.unwind_sell(
+                filled_token, filled_size, filled_price,
+                filled_neg_risk, filled_fee_bps, filled_tick,
+                config.unwind_max_loss_pct,
+            ).await;
+
+            let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+            let rc = if unwind_ok { "PARTIAL_UNWIND_OK" } else { "PARTIAL_UNWIND_FAILED" };
+            info!("executor: CANCELLED({}) run={} total={:.1}ms", rc, run_id, total_ms);
+            return RustExecutionResult {
+                status: "CANCELLED".into(),
+                run_id,
+                market_id: opp.market_id.clone(),
+                yes_order_id: Some(yes_oid),
+                no_order_id: Some(no_oid),
+                reason: format!("{} {}_filled={:.4} unwind={}", rc, filled_label, filled_size, unwind_ok),
+                reason_code: Some(rc.into()),
+                yes_filled_size: yes_filled,
+                no_filled_size: no_filled,
+                sign_ms,
+                submit_ms,
+                total_ms,
+            };
+        }
+
+        // ----- Case C: Nothing filled -----
+        let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+        info!("executor: CANCELLED(no fills) run={} total={:.1}ms", run_id, total_ms);
         RustExecutionResult {
-            status: status.to_string(),
+            status: "CANCELLED".into(),
             run_id,
             market_id: opp.market_id.clone(),
-            yes_order_id,
-            no_order_id,
-            reason,
-            reason_code,
+            yes_order_id: Some(yes_oid),
+            no_order_id: Some(no_oid),
+            reason: "TIMEOUT_NO_FILLS".into(),
+            reason_code: Some("TIMEOUT_NO_FILLS".into()),
             yes_filled_size: 0.0,
             no_filled_size: 0.0,
             sign_ms,
@@ -273,9 +446,86 @@ impl FastExecutor {
         }
     }
 
-    // -----------------------------------------------------------------------
+    // =====================================================================
+    // Recovery helpers
+    // =====================================================================
+
+    /// Attempt to buy the other leg with FAK. Returns true if filled.
+    async fn retry_buy(
+        &self,
+        token_id: &str,
+        price: f64,
+        size: f64,
+        fee_rate_bps: u32,
+        neg_risk: bool,
+        poll_interval: Duration,
+        retry_duration_ms: u64,
+        run_id: &str,
+    ) -> bool {
+        let order = self.build_order(token_id, price, size, fee_rate_bps, BUY);
+        let sig = match self.sign_order(&order, neg_risk) {
+            Ok(s) => s,
+            Err(e) => { error!("retry sign failed: {} run={}", e, run_id); return false; }
+        };
+        let body = self.build_post_body(&order, &sig, "FAK");
+        let resp = match self.post_order(&body).await {
+            Ok(v) => v,
+            Err(e) => { error!("retry POST failed: {} run={}", e, run_id); return false; }
+        };
+        let retry_oid = match extract_order_id(&resp) {
+            Some(id) => id,
+            None => { error!("retry: no orderID in response run={}", run_id); return false; }
+        };
+
+        let deadline = Instant::now() + Duration::from_millis(retry_duration_ms);
+        while Instant::now() < deadline {
+            if let Some((st, sz)) = self.get_order_status(&retry_oid).await {
+                if is_done(&st) && sz > 0.0 { return true; }
+                if is_done(&st) { return false; } // terminal but no fill
+            }
+            sleep(poll_interval).await;
+        }
+        false
+    }
+
+    /// Sell shares to unwind a one-sided position. Uses FAK at loss-capped price.
+    async fn unwind_sell(
+        &self,
+        token_id: &str,
+        shares: f64,
+        buy_price: f64,
+        neg_risk: bool,
+        fee_rate_bps: u32,
+        tick_size: &str,
+        max_loss_pct: f64,
+    ) -> bool {
+        if shares <= 0.0 { return false; }
+
+        // Floor price = buy_price minus max acceptable loss
+        let min_price = (buy_price * (1.0 - max_loss_pct / 100.0)).max(0.0001);
+        let sell_price = round_to_tick(min_price, tick_size);
+
+        let order = self.build_order(token_id, sell_price, shares, fee_rate_bps, SELL);
+        let sig = match self.sign_order(&order, neg_risk) {
+            Ok(s) => s,
+            Err(e) => { error!("unwind sign failed: {}", e); return false; }
+        };
+        let body = self.build_post_body(&order, &sig, "FAK");
+        match self.post_order(&body).await {
+            Ok(v) => {
+                info!("unwind sell submitted: oid={:?}", extract_order_id(&v));
+                true
+            }
+            Err(e) => {
+                error!("unwind sell POST failed: {}", e);
+                false
+            }
+        }
+    }
+
+    // =====================================================================
     // Order construction
-    // -----------------------------------------------------------------------
+    // =====================================================================
 
     fn build_order(
         &self,
@@ -283,18 +533,25 @@ impl FastExecutor {
         price: f64,
         size: f64,
         fee_rate_bps: u32,
+        side: u8,
     ) -> Order {
         // Polymarket uses 6 decimals (USDC): 1 USDC = 1_000_000
-        // makerAmount = size * price * 1e6 (USDC you pay)
-        // takerAmount = size * 1e6           (shares you receive)
-        let maker_amount = (size * price * 1_000_000.0) as u128;
-        let taker_amount = (size * 1_000_000.0) as u128;
+        // BUY:  makerAmount = price*size*1e6 (USDC you pay),   takerAmount = size*1e6 (shares)
+        // SELL: makerAmount = size*1e6 (shares you give),      takerAmount = price*size*1e6 (USDC)
+        let (maker_amount, taker_amount) = if side == BUY {
+            (
+                (size * price * 1_000_000.0) as u128,
+                (size * 1_000_000.0) as u128,
+            )
+        } else {
+            (
+                (size * 1_000_000.0) as u128,
+                (size * price * 1_000_000.0) as u128,
+            )
+        };
 
         let salt: u64 = rand_salt();
-
-        let maker_addr = Address::from_str(&self.funder_address)
-            .unwrap_or_default();
-
+        let maker_addr = Address::from_str(&self.funder_address).unwrap_or_default();
         let token_id_u256 = U256::from_str(token_id).unwrap_or_default();
 
         Order {
@@ -305,17 +562,17 @@ impl FastExecutor {
             tokenId: token_id_u256,
             makerAmount: U256::from(maker_amount),
             takerAmount: U256::from(taker_amount),
-            expiration: U256::ZERO, // No expiration
+            expiration: U256::ZERO,
             nonce: U256::ZERO,
             feeRateBps: U256::from(fee_rate_bps),
-            side: 0, // BUY = 0
+            side,
             signatureType: self.signature_type as u8,
         }
     }
 
-    // -----------------------------------------------------------------------
-    // EIP-712 signing (using k256 directly)
-    // -----------------------------------------------------------------------
+    // =====================================================================
+    // EIP-712 signing (k256 direct)
+    // =====================================================================
 
     fn sign_order(&self, order: &Order, neg_risk: bool) -> Result<String> {
         let exchange_addr = if neg_risk {
@@ -331,37 +588,31 @@ impl FastExecutor {
             verifying_contract: exchange_addr,
         };
 
-        // Compute EIP-712 signing hash
         let signing_hash: B256 = order.eip712_signing_hash(&domain);
 
-        // Sign the hash with k256 ECDSA (secp256k1)
         let (sig, recid) = self.signing_key
             .sign_prehash(signing_hash.as_ref())
             .map_err(|e| anyhow!("ECDSA sign failed: {e}"))?;
 
-        // Build 65-byte Ethereum signature: r (32) + s (32) + v (1)
         let mut sig_bytes = [0u8; 65];
         sig_bytes[..64].copy_from_slice(&sig.to_bytes());
-        sig_bytes[64] = recid.to_byte() + 27; // Ethereum v = recid + 27
+        sig_bytes[64] = recid.to_byte() + 27;
 
         Ok(format!("0x{}", hex::encode(sig_bytes)))
     }
 
-    // -----------------------------------------------------------------------
+    // =====================================================================
     // POST body construction
-    // -----------------------------------------------------------------------
+    // =====================================================================
 
     fn build_post_body(
         &self,
         order: &Order,
         signature: &str,
+        order_type: &str,
     ) -> serde_json::Value {
-        // Match py-clob-client's SignedOrder.dict() field types exactly:
-        //   salt → int, signatureType → int, side → "BUY"/"SELL"
-        //   all other numeric fields → string
-        //   addresses → checksummed (Display format)
         let salt_u64 = order.salt.as_limbs()[0];
-        let side_str = if order.side == 0 { "BUY" } else { "SELL" };
+        let side_str = if order.side == BUY { "BUY" } else { "SELL" };
 
         serde_json::json!({
             "order": {
@@ -380,33 +631,27 @@ impl FastExecutor {
                 "signature": signature,
             },
             "owner": self.api_key,
-            "orderType": "GTC",
+            "orderType": order_type,
         })
     }
 
-    // -----------------------------------------------------------------------
-    // HTTP submission with HMAC auth
-    // -----------------------------------------------------------------------
+    // =====================================================================
+    // HTTP helpers
+    // =====================================================================
 
+    /// POST /order — submit a signed order to the CLOB.
     async fn post_order(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
         let path = "/order";
         let url = format!("{}{}", self.clob_base_url, path);
         let body_str = serde_json::to_string(body)?;
 
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .to_string();
-
+        let timestamp = now_unix_secs();
         let hmac_sig = self.compute_hmac(&timestamp, "POST", path, &body_str)?;
 
-        let poly_address = format!("{}", self.signer_address);
-        let resp = self
-            .http
+        let resp = self.http
             .post(&url)
             .header("Content-Type", "application/json")
-            .header("POLY_ADDRESS", &poly_address)
+            .header("POLY_ADDRESS", format!("{}", self.signer_address))
             .header("POLY_SIGNATURE", &hmac_sig)
             .header("POLY_TIMESTAMP", &timestamp)
             .header("POLY_API_KEY", &self.api_key)
@@ -431,8 +676,79 @@ impl FastExecutor {
             .context("Failed to parse CLOB response JSON")
     }
 
+    /// GET /data/order/{id} — fetch order status + filled size.
+    async fn get_order_status(&self, order_id: &str) -> Option<(String, f64)> {
+        let path = format!("/data/order/{}", order_id);
+        let url = format!("{}{}", self.clob_base_url, &path);
+
+        let timestamp = now_unix_secs();
+        let hmac_sig = self.compute_hmac(&timestamp, "GET", &path, "").ok()?;
+
+        let resp = self.http
+            .get(&url)
+            .header("POLY_ADDRESS", format!("{}", self.signer_address))
+            .header("POLY_SIGNATURE", &hmac_sig)
+            .header("POLY_TIMESTAMP", &timestamp)
+            .header("POLY_API_KEY", &self.api_key)
+            .header("POLY_PASSPHRASE", &self.api_passphrase)
+            .send()
+            .await
+            .ok()?;
+
+        if !resp.status().is_success() { return None; }
+
+        let body: serde_json::Value = resp.json().await.ok()?;
+
+        let status = body.get("status")
+            .or_else(|| body.get("state"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_uppercase())
+            .unwrap_or_default();
+
+        // Polymarket uses various field names for filled size
+        let filled = ["sizeMatched", "filledSize", "matchedSize", "filled", "filled_size", "size_matched"]
+            .iter()
+            .find_map(|&k| body.get(k))
+            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(0.0);
+
+        Some((status, filled))
+    }
+
+    /// DELETE /orders — batch cancel orders by ID.
+    async fn cancel_orders(&self, order_ids: &[&str]) -> Result<()> {
+        if order_ids.is_empty() { return Ok(()); }
+
+        let path = "/orders";
+        let url = format!("{}{}", self.clob_base_url, path);
+        let body = serde_json::json!(order_ids);
+        let body_str = serde_json::to_string(&body)?;
+
+        let timestamp = now_unix_secs();
+        let hmac_sig = self.compute_hmac(&timestamp, "DELETE", path, &body_str)?;
+
+        let resp = self.http
+            .delete(&url)
+            .header("Content-Type", "application/json")
+            .header("POLY_ADDRESS", format!("{}", self.signer_address))
+            .header("POLY_SIGNATURE", &hmac_sig)
+            .header("POLY_TIMESTAMP", &timestamp)
+            .header("POLY_API_KEY", &self.api_key)
+            .header("POLY_PASSPHRASE", &self.api_passphrase)
+            .body(body_str)
+            .send()
+            .await
+            .context("cancel_orders HTTP DELETE failed")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("cancel_orders returned {}: {}", status, &text[..text.len().min(300)]));
+        }
+        Ok(())
+    }
+
     /// Compute HMAC-SHA256 L2 auth signature.
-    /// Message format: timestamp + method + path + body (plain concatenation, no separators)
     fn compute_hmac(
         &self,
         timestamp: &str,
@@ -456,34 +772,49 @@ impl FastExecutor {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Free-standing helpers
 // ---------------------------------------------------------------------------
 
 fn aggressive_buy_limit(best_ask: f64, cross_bps: f64) -> f64 {
-    if best_ask <= 0.0 {
-        return best_ask;
-    }
+    if best_ask <= 0.0 { return best_ask; }
     let bumped = best_ask * (1.0 + cross_bps / 10_000.0);
     bumped.min(0.9999).max(0.0001)
 }
 
 fn round_to_tick(price: f64, tick_size: &str) -> f64 {
     let tick: f64 = tick_size.parse().unwrap_or(0.01);
-    if tick <= 0.0 {
-        return price;
-    }
+    if tick <= 0.0 { return price; }
     (price / tick).round() * tick
+}
+
+fn is_done(status: &str) -> bool {
+    matches!(status, "FILLED" | "CANCELED" | "CANCELLED" | "REJECTED" | "FAILED" | "EXPIRED")
+}
+
+fn extract_order_id(v: &serde_json::Value) -> Option<String> {
+    v.get("orderID")
+        .or_else(|| v.get("id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn now_unix_secs() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
 }
 
 fn make_error_result(run_id: &str, market_id: &str, reason: &str, sign_ms: f64) -> RustExecutionResult {
     RustExecutionResult {
-        status: "FAILED".to_string(),
+        status: "FAILED".into(),
         run_id: run_id.to_string(),
         market_id: market_id.to_string(),
         yes_order_id: None,
         no_order_id: None,
         reason: reason.to_string(),
-        reason_code: Some("SIGN_ERROR".to_string()),
+        reason_code: Some("SIGN_ERROR".into()),
         yes_filled_size: 0.0,
         no_filled_size: 0.0,
         sign_ms,
@@ -492,7 +823,6 @@ fn make_error_result(run_id: &str, market_id: &str, reason: &str, sign_ms: f64) 
     }
 }
 
-/// Simple random u64 for run IDs (no need for cryptographic quality).
 fn rand_u64() -> u64 {
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -500,7 +830,6 @@ fn rand_u64() -> u64 {
     t.as_nanos() as u64 ^ (t.subsec_nanos() as u64).wrapping_mul(0x517cc1b727220a95)
 }
 
-/// Random u64 salt for orders (matches py-clob-client's generate_seed range).
 fn rand_salt() -> u64 {
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)

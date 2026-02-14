@@ -309,6 +309,12 @@ async def run_rust_hotpath(
     rcfg.cross_bps = float(os.getenv("CLOB_AGGRESSIVE_CROSS_BPS", "5"))
     rcfg.min_order_usd = float(os.getenv("CLOB_MIN_ORDER_USD", "1.0"))
     rcfg.min_order_shares = float(os.getenv("CLOB_MIN_ORDER_SHARES", "5"))
+    # Complete-or-abort safety parameters (match Python executor defaults)
+    rcfg.wait_for_both_ms = int(os.getenv("WAIT_FOR_BOTH_MS", "500"))
+    rcfg.poll_interval_ms = int(os.getenv("POLL_INTERVAL_MS", "50"))
+    rcfg.retry_duration_ms = int(os.getenv("RETRY_DURATION_MS", "200"))
+    rcfg.retry_slippage_pct = float(os.getenv("RETRY_SLIPPAGE_PERCENT", "1.5"))
+    rcfg.unwind_max_loss_pct = float(os.getenv("UNWIND_MAX_LOSS_PERCENT", "3.0"))
 
     engine = HotPathEngine(rcfg, on_opportunity, on_execution, on_ws_event)
     loaded = engine.load_markets(json.dumps(markets))
