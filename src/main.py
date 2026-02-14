@@ -185,6 +185,9 @@ async def run_rust_hotpath(
     def on_opportunity(ropp) -> None:
         try:
             opp = _to_py_opp(ropp)
+            # Keep latest opp cached for execution callback even if this opp is filtered for alerts.
+            last_opp_by_market[opp.market_id] = opp
+
             if not _passes_time_gates(opp):
                 return
 
@@ -193,7 +196,6 @@ async def run_rust_hotpath(
             if prev is not None and abs(opp.net_edge_percent - prev[0]) < 0.001:
                 return
             alert_last[opp.market_id] = (opp.net_edge_percent, now_ts)
-            last_opp_by_market[opp.market_id] = opp
 
             asyncio.run_coroutine_threadsafe(db.log_opportunity(opp), loop)
             asyncio.run_coroutine_threadsafe(discord.send_opportunity(opp), loop)
