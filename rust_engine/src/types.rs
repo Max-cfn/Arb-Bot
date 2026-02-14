@@ -108,6 +108,12 @@ pub struct EngineConfig {
     #[pyo3(get, set)] pub cross_bps: f64,
     #[pyo3(get, set)] pub min_order_usd: f64,
     #[pyo3(get, set)] pub min_order_shares: f64,
+    // Safety / complete-or-abort parameters
+    #[pyo3(get, set)] pub wait_for_both_ms: u64,
+    #[pyo3(get, set)] pub poll_interval_ms: u64,
+    #[pyo3(get, set)] pub retry_duration_ms: u64,
+    #[pyo3(get, set)] pub retry_slippage_pct: f64,
+    #[pyo3(get, set)] pub unwind_max_loss_pct: f64,
 }
 
 #[pymethods]
@@ -133,6 +139,11 @@ impl EngineConfig {
             cross_bps: 5.0,
             min_order_usd: 1.0,
             min_order_shares: 5.0,
+            wait_for_both_ms: 500,
+            poll_interval_ms: 50,
+            retry_duration_ms: 200,
+            retry_slippage_pct: 1.5,
+            unwind_max_loss_pct: 3.0,
         }
     }
 }
