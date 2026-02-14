@@ -130,6 +130,15 @@ impl FastExecutor {
     ) -> RustExecutionResult {
         let t_start = Instant::now();
         let run_id = format!("R{:x}", rand_u64());
+        let detect_ns = opp.t_detect_ns;
+        let timing_since_detect = |label: &str| {
+            if detect_ns > 0 {
+                if let Some(ms) = delta_ms_from_unix_ns(detect_ns) {
+                    return format!(" {}={:.5}ms", label, ms);
+                }
+            }
+            String::new()
+        };
 
         // -----------------------------------------------------------------
         // Resolve market metadata
@@ -212,9 +221,11 @@ impl FastExecutor {
                 yes_order_id: None,
                 no_order_id: None,
                 reason: format!(
-                    "both POSTs failed yes_err={} no_err={}",
+                    "both POSTs failed yes_err={} no_err={}{}{}",
                     yes_resp.err().map(|e| e.to_string()).unwrap_or_default(),
                     no_resp.err().map(|e| e.to_string()).unwrap_or_default(),
+                    timing_since_detect("detect_to_sign"),
+                    timing_since_detect("detect_to_submit"),
                 ),
                 reason_code: Some("POST_FAILED".into()),
                 yes_filled_size: 0.0,
@@ -237,7 +248,11 @@ impl FastExecutor {
                 market_id: opp.market_id.clone(),
                 yes_order_id: yes_order_id.clone(),
                 no_order_id: no_order_id.clone(),
-                reason: "one POST failed, cancelled surviving order".into(),
+                reason: format!(
+                    "one POST failed, cancelled surviving order{}{}",
+                    timing_since_detect("detect_to_sign"),
+                    timing_since_detect("detect_to_submit"),
+                ),
                 reason_code: Some("PARTIAL_POST_CANCELLED".into()),
                 yes_filled_size: 0.0,
                 no_filled_size: 0.0,
@@ -281,7 +296,13 @@ impl FastExecutor {
                     market_id: opp.market_id.clone(),
                     yes_order_id: Some(yes_oid),
                     no_order_id: Some(no_oid),
-                    reason: format!("BOTH_FILLED yes={:.4} no={:.4}", yes_filled, no_filled),
+                    reason: format!(
+                        "BOTH_FILLED yes={:.4} no={:.4}{}{}",
+                        yes_filled,
+                        no_filled,
+                        timing_since_detect("detect_to_sign"),
+                        timing_since_detect("detect_to_submit"),
+                    ),
                     reason_code: Some("BOTH_FILLED".into()),
                     yes_filled_size: yes_filled,
                     no_filled_size: no_filled,
@@ -345,7 +366,13 @@ impl FastExecutor {
                 market_id: opp.market_id.clone(),
                 yes_order_id: Some(yes_oid),
                 no_order_id: Some(no_oid),
-                reason: format!("RECOVERY_BOTH_FILLED yes={:.4} no={:.4}", yes_filled, no_filled),
+                reason: format!(
+                    "RECOVERY_BOTH_FILLED yes={:.4} no={:.4}{}{}",
+                    yes_filled,
+                    no_filled,
+                    timing_since_detect("detect_to_sign"),
+                    timing_since_detect("detect_to_submit"),
+                ),
                 reason_code: Some("RECOVERY_BOTH_FILLED".into()),
                 yes_filled_size: yes_filled,
                 no_filled_size: no_filled,
@@ -390,7 +417,13 @@ impl FastExecutor {
                     market_id: opp.market_id.clone(),
                     yes_order_id: Some(yes_oid),
                     no_order_id: Some(no_oid),
-                    reason: format!("PARTIAL_RETRY_SUCCESS {}_filled={:.4}", filled_label, filled_size),
+                    reason: format!(
+                        "PARTIAL_RETRY_SUCCESS {}_filled={:.4}{}{}",
+                        filled_label,
+                        filled_size,
+                        timing_since_detect("detect_to_sign"),
+                        timing_since_detect("detect_to_submit"),
+                    ),
                     reason_code: Some("PARTIAL_RETRY_SUCCESS".into()),
                     yes_filled_size: if yes_filled > 0.0 { yes_filled } else { filled_size },
                     no_filled_size: if no_filled > 0.0 { no_filled } else { filled_size },
@@ -417,7 +450,15 @@ impl FastExecutor {
                 market_id: opp.market_id.clone(),
                 yes_order_id: Some(yes_oid),
                 no_order_id: Some(no_oid),
-                reason: format!("{} {}_filled={:.4} unwind={}", rc, filled_label, filled_size, unwind_ok),
+                reason: format!(
+                    "{} {}_filled={:.4} unwind={}{}{}",
+                    rc,
+                    filled_label,
+                    filled_size,
+                    unwind_ok,
+                    timing_since_detect("detect_to_sign"),
+                    timing_since_detect("detect_to_submit"),
+                ),
                 reason_code: Some(rc.into()),
                 yes_filled_size: yes_filled,
                 no_filled_size: no_filled,
@@ -436,7 +477,11 @@ impl FastExecutor {
             market_id: opp.market_id.clone(),
             yes_order_id: Some(yes_oid),
             no_order_id: Some(no_oid),
-            reason: "TIMEOUT_NO_FILLS".into(),
+            reason: format!(
+                "TIMEOUT_NO_FILLS{}{}",
+                timing_since_detect("detect_to_sign"),
+                timing_since_detect("detect_to_submit"),
+            ),
             reason_code: Some("TIMEOUT_NO_FILLS".into()),
             yes_filled_size: 0.0,
             no_filled_size: 0.0,
@@ -804,6 +849,14 @@ fn now_unix_secs() -> String {
         .unwrap_or_default()
         .as_secs()
         .to_string()
+}
+
+fn delta_ms_from_unix_ns(start_ns: u64) -> Option<f64> {
+    let now_ns = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_nanos() as u64;
+    if now_ns < start_ns {
+        return None;
+    }
+    Some((now_ns - start_ns) as f64 / 1_000_000.0)
 }
 
 fn make_error_result(run_id: &str, market_id: &str, reason: &str, sign_ms: f64) -> RustExecutionResult {
