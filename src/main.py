@@ -129,6 +129,8 @@ async def run_rust_hotpath(
 
     alert_last: dict[str, tuple[float, float]] = {}
     last_opp_by_market: dict[str, ArbitrageOpportunity] = {}
+    exec_last_sent: dict[tuple[str, str], float] = {}
+    exec_suppressed: dict[tuple[str, str], int] = {}
 
     def _to_py_opp(ropp) -> ArbitrageOpportunity:
         opp = ArbitrageOpportunity(
@@ -231,6 +233,29 @@ async def run_rust_hotpath(
             no_notional = no_qty * no_price
             total_notional = yes_notional + no_notional
 
+            # Anti-spam: throttle repetitive failure/partial events per market+status.
+            now_ts = time.time()
+            throttle_window_s = float(os.getenv("EXEC_ALERT_THROTTLE_SECONDS", "15"))
+            throttle_key = (mid, status)
+            should_send = True
+            suppressed_now = 0
+
+            if status in {"FAILED", "PARTIAL_SUBMIT", "CANCELLED"}:
+                last_ts = exec_last_sent.get(throttle_key, 0.0)
+                if now_ts - last_ts < throttle_window_s:
+                    exec_suppressed[throttle_key] = exec_suppressed.get(throttle_key, 0) + 1
+                    should_send = False
+                else:
+                    suppressed_now = exec_suppressed.pop(throttle_key, 0)
+                    exec_last_sent[throttle_key] = now_ts
+            else:
+                # For positive states, always send and reset suppression counter.
+                suppressed_now = exec_suppressed.pop(throttle_key, 0)
+                exec_last_sent[throttle_key] = now_ts
+
+            if not should_send:
+                return
+
             note = (
                 f"rust_exec status={status}"
                 f"{(' | reason_code=' + reason_code) if reason_code else ''}\n"
@@ -242,6 +267,8 @@ async def run_rust_hotpath(
                 f"NO_qty={no_qty:.5f} @ ${no_price:.5f} => ${no_notional:.5f}\n"
                 f"sum_total=${total_notional:.5f} (constraints: min_shares>=5, min_notional_per_leg>=${min_order_usd:.2f})"
             )
+            if suppressed_now > 0:
+                note += f"\n(throttle) {suppressed_now} events similaires supprimés dans les {throttle_window_s:.0f}s"
 
             asyncio.run_coroutine_threadsafe(
                 discord.send_execution(
