@@ -118,6 +118,7 @@ pub struct EngineConfig {
     #[pyo3(get, set)] pub retry_duration_ms: u64,
     #[pyo3(get, set)] pub retry_slippage_pct: f64,
     #[pyo3(get, set)] pub unwind_max_loss_pct: f64,
+    #[pyo3(get, set)] pub exec_cooldown_ms: u64,
 }
 
 #[pymethods]
@@ -148,6 +149,7 @@ impl EngineConfig {
             retry_duration_ms: 200,
             retry_slippage_pct: 1.5,
             unwind_max_loss_pct: 3.0,
+            exec_cooldown_ms: 15_000,
         }
     }
 }
