@@ -122,13 +122,15 @@ impl FastExecutor {
         let t_start = Instant::now();
         let run_id = format!("R{:x}", rand_u64());
 
-        // Determine tick_size and neg_risk from cache
+        // Determine tick_size, neg_risk, and fee_rate from cache
         let yes_meta = meta_cache.get(&opp.yes_token_id);
         let no_meta = meta_cache.get(&opp.no_token_id);
         let yes_neg_risk = yes_meta.as_ref().map(|m| m.neg_risk).unwrap_or(false);
         let no_neg_risk = no_meta.as_ref().map(|m| m.neg_risk).unwrap_or(false);
         let yes_tick = yes_meta.as_ref().map(|m| m.tick_size.as_str()).unwrap_or("0.01");
         let no_tick = no_meta.as_ref().map(|m| m.tick_size.as_str()).unwrap_or("0.01");
+        let yes_fee_bps = yes_meta.as_ref().map(|m| m.fee_rate_bps).unwrap_or(0);
+        let no_fee_bps = no_meta.as_ref().map(|m| m.fee_rate_bps).unwrap_or(0);
 
         // Compute aggressive limit prices (cross above best ask)
         let yes_limit = aggressive_buy_limit(opp.yes_best_ask, config.cross_bps);
@@ -153,11 +155,13 @@ impl FastExecutor {
             &opp.yes_token_id,
             yes_price_rounded,
             shares as f64,
+            yes_fee_bps,
         );
         let no_order = self.build_order(
             &opp.no_token_id,
             no_price_rounded,
             shares as f64,
+            no_fee_bps,
         );
 
         // Sign both (synchronous ECDSA, very fast — <1ms each)
@@ -180,8 +184,8 @@ impl FastExecutor {
         };
 
         // Build POST bodies
-        let yes_body = self.build_post_body(&yes_order, &yes_sig, yes_tick, yes_neg_risk);
-        let no_body = self.build_post_body(&no_order, &no_sig, no_tick, no_neg_risk);
+        let yes_body = self.build_post_body(&yes_order, &yes_sig);
+        let no_body = self.build_post_body(&no_order, &no_sig);
 
         // POST both in parallel
         let t_submit_start = Instant::now();
@@ -278,6 +282,7 @@ impl FastExecutor {
         token_id: &str,
         price: f64,
         size: f64,
+        fee_rate_bps: u32,
     ) -> Order {
         // Polymarket uses 6 decimals (USDC): 1 USDC = 1_000_000
         // makerAmount = size * price * 1e6 (USDC you pay)
@@ -285,7 +290,7 @@ impl FastExecutor {
         let maker_amount = (size * price * 1_000_000.0) as u128;
         let taker_amount = (size * 1_000_000.0) as u128;
 
-        let salt: u128 = rand_u128();
+        let salt: u64 = rand_salt();
 
         let maker_addr = Address::from_str(&self.funder_address)
             .unwrap_or_default();
@@ -302,7 +307,7 @@ impl FastExecutor {
             takerAmount: U256::from(taker_amount),
             expiration: U256::ZERO, // No expiration
             nonce: U256::ZERO,
-            feeRateBps: U256::ZERO,
+            feeRateBps: U256::from(fee_rate_bps),
             side: 0, // BUY = 0
             signatureType: self.signature_type as u8,
         }
@@ -320,7 +325,7 @@ impl FastExecutor {
         };
 
         let domain = eip712_domain! {
-            name: "ClobExchange",
+            name: "Polymarket CTF Exchange",
             version: "1",
             chain_id: self.chain_id,
             verifying_contract: exchange_addr,
@@ -350,29 +355,32 @@ impl FastExecutor {
         &self,
         order: &Order,
         signature: &str,
-        tick_size: &str,
-        neg_risk: bool,
     ) -> serde_json::Value {
+        // Match py-clob-client's SignedOrder.dict() field types exactly:
+        //   salt → int, signatureType → int, side → "BUY"/"SELL"
+        //   all other numeric fields → string
+        //   addresses → checksummed (Display format)
+        let salt_u64 = order.salt.as_limbs()[0];
+        let side_str = if order.side == 0 { "BUY" } else { "SELL" };
+
         serde_json::json!({
             "order": {
-                "salt": order.salt.to_string(),
-                "maker": format!("{:?}", order.maker),
-                "signer": format!("{:?}", order.signer),
-                "taker": format!("{:?}", order.taker),
+                "salt": salt_u64,
+                "maker": format!("{}", order.maker),
+                "signer": format!("{}", order.signer),
+                "taker": format!("{}", order.taker),
                 "tokenId": order.tokenId.to_string(),
                 "makerAmount": order.makerAmount.to_string(),
                 "takerAmount": order.takerAmount.to_string(),
                 "expiration": order.expiration.to_string(),
                 "nonce": order.nonce.to_string(),
                 "feeRateBps": order.feeRateBps.to_string(),
-                "side": order.side.to_string(),
-                "signatureType": order.signatureType.to_string(),
+                "side": side_str,
+                "signatureType": order.signatureType,
                 "signature": signature,
             },
-            "owner": self.funder_address,
+            "owner": self.api_key,
             "orderType": "GTC",
-            "tick_size": tick_size,
-            "neg_risk": neg_risk,
         })
     }
 
@@ -492,10 +500,12 @@ fn rand_u64() -> u64 {
     t.as_nanos() as u64 ^ (t.subsec_nanos() as u64).wrapping_mul(0x517cc1b727220a95)
 }
 
-/// Simple random u128 for order salts.
-fn rand_u128() -> u128 {
+/// Random u64 salt for orders (matches py-clob-client's generate_seed range).
+fn rand_salt() -> u64 {
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    t.as_nanos() ^ ((t.subsec_nanos() as u128).wrapping_mul(0x6c62272e07bb014262b821756295c58d))
+    let millis = t.as_millis() as u64;
+    let factor = (t.subsec_nanos() as u64 % 1_000_000).wrapping_add(1);
+    millis.wrapping_mul(factor)
 }
