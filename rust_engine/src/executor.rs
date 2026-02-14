@@ -230,6 +230,10 @@ impl FastExecutor {
                 reason_code: Some("POST_FAILED".into()),
                 yes_filled_size: 0.0,
                 no_filled_size: 0.0,
+                yes_target_price: yes_price,
+                no_target_price: no_price,
+                yes_final_price: 0.0,
+                no_final_price: 0.0,
                 sign_ms,
                 submit_ms,
                 total_ms,
@@ -256,6 +260,10 @@ impl FastExecutor {
                 reason_code: Some("PARTIAL_POST_CANCELLED".into()),
                 yes_filled_size: 0.0,
                 no_filled_size: 0.0,
+                yes_target_price: yes_price,
+                no_target_price: no_price,
+                yes_final_price: 0.0,
+                no_final_price: 0.0,
                 sign_ms,
                 submit_ms,
                 total_ms,
@@ -275,6 +283,8 @@ impl FastExecutor {
 
         let mut yes_filled = 0.0_f64;
         let mut no_filled = 0.0_f64;
+        let mut yes_final_price = 0.0_f64;
+        let mut no_final_price = 0.0_f64;
         let mut yes_done = false;
         let mut no_done = false;
 
@@ -283,8 +293,8 @@ impl FastExecutor {
                 self.get_order_status(&yes_oid),
                 self.get_order_status(&no_oid),
             );
-            if let Some((st, sz)) = ys { yes_done = is_done(&st); yes_filled = sz; }
-            if let Some((st, sz)) = ns { no_done = is_done(&st); no_filled = sz; }
+            if let Some((st, sz, px)) = ys { yes_done = is_done(&st); yes_filled = sz; if px > 0.0 { yes_final_price = px; } }
+            if let Some((st, sz, px)) = ns { no_done = is_done(&st); no_filled = sz; if px > 0.0 { no_final_price = px; } }
 
             // Both legs filled → success, fast return
             if yes_filled > 0.0 && no_filled > 0.0 && yes_done && no_done {
@@ -306,6 +316,10 @@ impl FastExecutor {
                     reason_code: Some("BOTH_FILLED".into()),
                     yes_filled_size: yes_filled,
                     no_filled_size: no_filled,
+                    yes_target_price: yes_price,
+                    no_target_price: no_price,
+                    yes_final_price,
+                    no_final_price,
                     sign_ms,
                     submit_ms,
                     total_ms,
@@ -342,8 +356,8 @@ impl FastExecutor {
                 self.get_order_status(&yes_oid),
                 self.get_order_status(&no_oid),
             );
-            if let Some((_st, sz)) = ys { yes_filled = sz; }
-            if let Some((_st, sz)) = ns { no_filled = sz; }
+            if let Some((_st, sz, px)) = ys { yes_filled = sz; if px > 0.0 { yes_final_price = px; } }
+            if let Some((_st, sz, px)) = ns { no_filled = sz; if px > 0.0 { no_final_price = px; } }
         }
 
         // ----- Case A: Both legs have fills (possibly mismatched) -----
@@ -376,6 +390,10 @@ impl FastExecutor {
                 reason_code: Some("RECOVERY_BOTH_FILLED".into()),
                 yes_filled_size: yes_filled,
                 no_filled_size: no_filled,
+                yes_target_price: yes_price,
+                no_target_price: no_price,
+                yes_final_price,
+                no_final_price,
                 sign_ms,
                 submit_ms,
                 total_ms,
@@ -427,6 +445,10 @@ impl FastExecutor {
                     reason_code: Some("PARTIAL_RETRY_SUCCESS".into()),
                     yes_filled_size: if yes_filled > 0.0 { yes_filled } else { filled_size },
                     no_filled_size: if no_filled > 0.0 { no_filled } else { filled_size },
+                    yes_target_price: yes_price,
+                    no_target_price: no_price,
+                    yes_final_price,
+                    no_final_price,
                     sign_ms,
                     submit_ms,
                     total_ms,
@@ -462,6 +484,10 @@ impl FastExecutor {
                 reason_code: Some(rc.into()),
                 yes_filled_size: yes_filled,
                 no_filled_size: no_filled,
+                yes_target_price: yes_price,
+                no_target_price: no_price,
+                yes_final_price,
+                no_final_price,
                 sign_ms,
                 submit_ms,
                 total_ms,
@@ -485,6 +511,10 @@ impl FastExecutor {
             reason_code: Some("TIMEOUT_NO_FILLS".into()),
             yes_filled_size: 0.0,
             no_filled_size: 0.0,
+            yes_target_price: yes_price,
+            no_target_price: no_price,
+            yes_final_price,
+            no_final_price,
             sign_ms,
             submit_ms,
             total_ms,
@@ -524,7 +554,7 @@ impl FastExecutor {
 
         let deadline = Instant::now() + Duration::from_millis(retry_duration_ms);
         while Instant::now() < deadline {
-            if let Some((st, sz)) = self.get_order_status(&retry_oid).await {
+            if let Some((st, sz, _px)) = self.get_order_status(&retry_oid).await {
                 if is_done(&st) && sz > 0.0 { return true; }
                 if is_done(&st) { return false; } // terminal but no fill
             }
@@ -722,7 +752,7 @@ impl FastExecutor {
     }
 
     /// GET /data/order/{id} — fetch order status + filled size.
-    async fn get_order_status(&self, order_id: &str) -> Option<(String, f64)> {
+    async fn get_order_status(&self, order_id: &str) -> Option<(String, f64, f64)> {
         let path = format!("/data/order/{}", order_id);
         let url = format!("{}{}", self.clob_base_url, &path);
 
@@ -757,7 +787,13 @@ impl FastExecutor {
             .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
             .unwrap_or(0.0);
 
-        Some((status, filled))
+        let avg_price = ["avgPrice", "averagePrice", "price", "filledPrice"]
+            .iter()
+            .find_map(|&k| body.get(k))
+            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(0.0);
+
+        Some((status, filled, avg_price))
     }
 
     /// DELETE /orders — batch cancel orders by ID.
@@ -870,6 +906,10 @@ fn make_error_result(run_id: &str, market_id: &str, reason: &str, sign_ms: f64) 
         reason_code: Some("SIGN_ERROR".into()),
         yes_filled_size: 0.0,
         no_filled_size: 0.0,
+        yes_target_price: 0.0,
+        no_target_price: 0.0,
+        yes_final_price: 0.0,
+        no_final_price: 0.0,
         sign_ms,
         submit_ms: 0.0,
         total_ms: sign_ms,

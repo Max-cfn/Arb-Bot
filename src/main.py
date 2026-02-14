@@ -229,9 +229,15 @@ async def run_rust_hotpath(
 
             yes_qty = float(shares)
             no_qty = float(shares)
-            yes_notional = yes_qty * yes_price
-            no_notional = no_qty * no_price
-            total_notional = yes_notional + no_notional
+
+            yes_target_price = float(getattr(res, "yes_target_price", yes_price) or yes_price)
+            no_target_price = float(getattr(res, "no_target_price", no_price) or no_price)
+            yes_final_price = float(getattr(res, "yes_final_price", 0.0) or 0.0)
+            no_final_price = float(getattr(res, "no_final_price", 0.0) or 0.0)
+
+            yes_target_notional = yes_qty * yes_target_price
+            no_target_notional = no_qty * no_target_price
+            total_target_notional = yes_target_notional + no_target_notional
 
             # Anti-spam: throttle repetitive failure/partial events per market+status.
             now_ts = time.time()
@@ -263,9 +269,10 @@ async def run_rust_hotpath(
                 f"durations_ms: sign={float(getattr(res, 'sign_ms', 0.0) or 0.0):.5f} | "
                 f"submit={float(getattr(res, 'submit_ms', 0.0) or 0.0):.5f} | "
                 f"total={float(getattr(res, 'total_ms', 0.0) or 0.0):.5f}\n"
-                f"buy_plan: YES_qty={yes_qty:.5f} @ ${yes_price:.5f} => ${yes_notional:.5f} | "
-                f"NO_qty={no_qty:.5f} @ ${no_price:.5f} => ${no_notional:.5f}\n"
-                f"sum_total=${total_notional:.5f} (constraints: min_shares>=5, min_notional_per_leg>=${min_order_usd:.2f})"
+                f"buy_plan(target): YES_qty={yes_qty:.5f} @ ${yes_target_price:.5f} => ${yes_target_notional:.5f} | "
+                f"NO_qty={no_qty:.5f} @ ${no_target_price:.5f} => ${no_target_notional:.5f}\n"
+                f"sum_target=${total_target_notional:.5f} (constraints: min_shares>=5, min_notional_per_leg>=${min_order_usd:.2f})\n"
+                f"buy_price_final: YES=${yes_final_price:.5f} | NO=${no_final_price:.5f} (0.00000 = non rempli/non dispo)"
             )
             if suppressed_now > 0:
                 note += f"\n(throttle) {suppressed_now} events similaires supprimés dans les {throttle_window_s:.0f}s"
