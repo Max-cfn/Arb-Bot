@@ -60,15 +60,8 @@ RUST_HOTPATH_ENABLED = os.getenv("RUST_HOTPATH_ENABLED", "1").strip().lower() in
 def is_trading_enabled() -> bool:
     """Return whether trading/execution is enabled.
 
-    This is intended to be toggled via Discord admin commands (or manually).
-
-    control.json example:
-      {"trading_enabled": true}
+    Single source of truth: CONTROL_FILE (Discord /killswitch).
     """
-    env_override = os.getenv("TRADING_ENABLED")
-    if env_override is not None:
-        return env_override.strip() not in {"0", "false", "False", "no", "NO"}
-
     try:
         data = json.loads(CONTROL_FILE.read_text())
         # allow a couple of keys for compatibility
@@ -320,8 +313,9 @@ async def run_rust_hotpath(
     rcfg.min_order_shares = float(os.getenv("CLOB_MIN_ORDER_SHARES", "5"))
     rcfg.min_execution_edge_percent = float(os.getenv("MIN_EXECUTION_EDGE_PERCENT", str(rcfg.min_edge_percent)))
     rcfg.max_edge_decay_bps = float(os.getenv("MAX_EDGE_DECAY_BPS", "25"))
-    rcfg.trading_enabled = os.getenv("TRADING_ENABLED", "1").strip().lower() not in {"0", "false", "off", "no"}
-    rcfg.trading_control_file = os.getenv("POLY_CONTROL_FILE", "")
+    # Single source of truth for trading toggle: control file (/killswitch).
+    rcfg.trading_enabled = is_trading_enabled()
+    rcfg.trading_control_file = str(CONTROL_FILE)
     rcfg.panic_partial_count = int(os.getenv("PANIC_PARTIAL_COUNT", "3"))
     rcfg.panic_partial_window_s = int(float(os.getenv("PANIC_PARTIAL_WINDOW_MIN", "10")) * 60)
     # Complete-or-abort safety parameters (match Python executor defaults)

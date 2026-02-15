@@ -95,7 +95,8 @@ class PolymarketClobExecutor:
         self._client: Optional[ClobClient] = None
 
     def _control_path(self) -> str:
-        return os.getenv("CONTROL_FILE", "data/control.json")
+        # Keep backward-compat with CONTROL_FILE, but prefer POLY_CONTROL_FILE (/killswitch path).
+        return os.getenv("POLY_CONTROL_FILE", os.getenv("CONTROL_FILE", "data/control.json"))
 
     def _log_exec(self, event: str, **fields) -> None:
         """Structured execution logs (JSON) for debugging early live tests.
