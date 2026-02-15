@@ -1103,87 +1103,154 @@ async def main() -> None:
                         attempted_cost_usd = float(shares * (yes_limit_est + no_limit_est))
 
                         # Send an immediate "attempt" message so #executions reflects real order attempts.
+                        # SUBMITTED alert — rich structured fields
+                        _sub_fields = [
+                            {
+                                "name": "Sizing",
+                                "value": (
+                                    f"**{shares}** shares each leg\n"
+                                    f"YES limit: **${yes_limit_est:.4f}**\n"
+                                    f"NO  limit: **${no_limit_est:.4f}**"
+                                ),
+                                "inline": True,
+                            },
+                            {
+                                "name": "Est. Cost",
+                                "value": (
+                                    f"**${attempted_cost_usd:.4f}** total\n"
+                                    f"(${yes_limit_est * shares:.4f} + ${no_limit_est * shares:.4f})"
+                                ),
+                                "inline": True,
+                            },
+                            {
+                                "name": "Latency",
+                                "value": (
+                                    f"Detect→submit: **{detect_to_send_ms:.1f}ms**"
+                                    if detect_to_send_ms is not None
+                                    else "Detect→submit: n/a"
+                                ),
+                                "inline": True,
+                            },
+                        ]
                         asyncio.create_task(
                             discord.send_execution(
                                 opp,
-                                note=(
-                                    "REAL_EXEC attempt: placing YES+NO buy orders now\n"
-                                    f"balance_usd=? (next msg) | attempted_cost_usd≈{attempted_cost_usd:.4f}\n"
-                                    f"shares={shares} (YES+NO) | yes_limit≈{yes_limit_est:.4f} no_limit≈{no_limit_est:.4f}\n"
-                                    f"inputs(best): yes={yes_best:.4f} no={no_best:.4f} | min_order_usd={min_order_usd} min_order_shares={min_order_shares} cross_bps={cross_bps}"
-                                ),
                                 run_id=run_id,
                                 status="SUBMITTED",
+                                extra_fields=_sub_fields,
                             ),
                             name=f"exec-real-attempt-{opp.market_id}",
                         )
 
                         async def _real_execute_and_report() -> None:
-                            # Best-effort balance/allowance snapshot (for #executions visibility)
-                            bal_summary = None
-                            bal_usd = None
-                            try:
-                                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-
-                                client = executor._get_client()  # uses API creds; does NOT place orders
-                                params = BalanceAllowanceParams(
-                                    asset_type=AssetType.COLLATERAL,
-                                    signature_type=int(getattr(executor, "signature_type", 0)),
-                                )
-                                try:
-                                    await asyncio.to_thread(lambda: client.update_balance_allowance(params))
-                                except Exception:
-                                    pass
-                                bal = await asyncio.to_thread(lambda: client.get_balance_allowance(params))
-
-                                # CLOB returns collateral balance in micro-units (1e6 = $1)
-                                if isinstance(bal, dict) and "balance" in bal:
-                                    bal_usd = int(str(bal.get("balance") or "0")) / 1_000_000.0
-                                    bal_summary = f"balance_usd={bal_usd:.6f} allowances_n={len(bal.get('allowances') or {}) if isinstance(bal.get('allowances'), dict) else 'n/a'}"
-                                else:
-                                    bal_summary = str(bal)[:500]
-                            except Exception:
-                                bal_summary = None
-
                             call_start_ns = time.monotonic_ns()
                             res = await executor.execute_two_leg(opp, run_id=run_id, metrics=metrics)
                             call_end_ns = time.monotonic_ns()
                             call_ms = (call_end_ns - call_start_ns) / 1e6
 
-                            submit_to_ack_ms = None
+                            # ── Timing breakdown ──────────────────────────────────────────
+                            m = res.metrics
+                            submit_to_ack_ms: float | None = None
+                            ack_to_fill_ms: float | None = None
+                            detect_to_fill_ms: float | None = None
                             try:
-                                if res.metrics and isinstance(res.metrics.t_ack_ns, int) and isinstance(res.metrics.t_submit_ns, int):
-                                    submit_to_ack_ms = (res.metrics.t_ack_ns - res.metrics.t_submit_ns) / 1e6
+                                if m and isinstance(m.t_ack_ns, int) and isinstance(m.t_submit_ns, int):
+                                    submit_to_ack_ms = (m.t_ack_ns - m.t_submit_ns) / 1e6
+                                if m and isinstance(m.t_both_filled_ns, int) and isinstance(m.t_ack_ns, int):
+                                    ack_to_fill_ms = (m.t_both_filled_ns - m.t_ack_ns) / 1e6
+                                if m and isinstance(m.t_both_filled_ns, int) and isinstance(m.t_detect_ns, int):
+                                    detect_to_fill_ms = (m.t_both_filled_ns - m.t_detect_ns) / 1e6
                             except Exception:
-                                submit_to_ack_ms = None
+                                pass
+
+                            yes_fs = float(getattr(res, "yes_filled_size", 0) or 0)
+                            no_fs = float(getattr(res, "no_filled_size", 0) or 0)
+                            actual_cost = (yes_fs * yes_limit_est) + (no_fs * no_limit_est)
+                            est_resolution = yes_fs + no_fs  # both resolve to $1/share
+                            est_profit_usd = max(0.0, est_resolution - actual_cost)
+                            est_edge_pct = (est_profit_usd / actual_cost * 100) if actual_cost > 0 else 0.0
+
+                            # ── Build result-specific extra_fields ────────────────────────
+                            final_status = res.status if res.status in {
+                                "SUBMITTED", "WAITING", "FILLED", "CANCELLED", "FAILED"
+                            } else "FAILED"
+
+                            if final_status == "FILLED":
+                                extra = [
+                                    {
+                                        "name": "Filled Sizes",
+                                        "value": (
+                                            f"YES: **{yes_fs:.0f}** shares @ ${yes_limit_est:.4f}\n"
+                                            f"NO:  **{no_fs:.0f}** shares @ ${no_limit_est:.4f}\n"
+                                            f"Symmetric: {'YES' if abs(yes_fs - no_fs) < 0.5 else 'NO (mismatch!)'}"
+                                        ),
+                                        "inline": True,
+                                    },
+                                    {
+                                        "name": "P&L Estimate",
+                                        "value": (
+                                            f"Cost: **${actual_cost:.4f}**\n"
+                                            f"At resolution: ${est_resolution:.4f}\n"
+                                            f"Est. profit: **+${est_profit_usd:.4f}** ({est_edge_pct:.2f}%)"
+                                        ),
+                                        "inline": True,
+                                    },
+                                    {
+                                        "name": "Latency",
+                                        "value": "\n".join(filter(None, [
+                                            f"Detect→submit: **{detect_to_send_ms:.1f}ms**" if detect_to_send_ms is not None else None,
+                                            f"Submit→ACK:    **{submit_to_ack_ms:.1f}ms**" if submit_to_ack_ms is not None else None,
+                                            f"ACK→fill:      **{ack_to_fill_ms:.1f}ms**" if ack_to_fill_ms is not None else None,
+                                            f"Detect→fill:   **{detect_to_fill_ms:.1f}ms**" if detect_to_fill_ms is not None else None,
+                                            f"Exec call:     {call_ms:.1f}ms",
+                                        ])) or "n/a",
+                                        "inline": True,
+                                    },
+                                    {
+                                        "name": "Order IDs",
+                                        "value": (
+                                            f"YES: `{str(getattr(res, 'yes_order_id', '') or '')[:24]}`\n"
+                                            f"NO:  `{str(getattr(res, 'no_order_id', '') or '')[:24]}`"
+                                        ),
+                                        "inline": True,
+                                    },
+                                    {
+                                        "name": "Code",
+                                        "value": f"`{getattr(res, 'reason_code', 'n/a') or 'n/a'}`",
+                                        "inline": True,
+                                    },
+                                ]
+                            else:
+                                # CANCELLED / FAILED — show reason + what filled
+                                filled_line = ""
+                                if yes_fs > 0 or no_fs > 0:
+                                    filled_line = f"\nYES filled: {yes_fs:.0f} | NO filled: {no_fs:.0f}"
+                                extra = [
+                                    {
+                                        "name": "Reason",
+                                        "value": (
+                                            f"`{getattr(res, 'reason_code', 'n/a') or 'n/a'}`\n"
+                                            + (res.reason[:700] if getattr(res, "reason", "") else "")
+                                            + filled_line
+                                        ),
+                                        "inline": False,
+                                    },
+                                    {
+                                        "name": "Latency",
+                                        "value": "\n".join(filter(None, [
+                                            f"Detect→submit: {detect_to_send_ms:.1f}ms" if detect_to_send_ms is not None else None,
+                                            f"Submit→ACK:    {submit_to_ack_ms:.1f}ms" if submit_to_ack_ms is not None else None,
+                                            f"Exec call:     {call_ms:.1f}ms",
+                                        ])) or "n/a",
+                                        "inline": True,
+                                    },
+                                ]
 
                             await discord.send_execution(
                                 opp,
-                                note=(
-                                    f"REAL_EXEC result status={res.status}\n"
-                                    + (f"reason={getattr(res, 'reason_code', None) or 'n/a'}\n")
-                                    + (f"detail={res.reason}\n" if getattr(res, 'reason', '') else "")
-                                    + (
-                                        f"balance_usd={bal_usd:.6f} | attempted_cost_usd≈{attempted_cost_usd:.4f}\n"
-                                        if bal_usd is not None
-                                        else f"attempted_cost_usd≈{attempted_cost_usd:.4f}\n"
-                                    )
-                                    + (
-                                        f"shares={shares} | yes_limit≈{yes_limit_est:.4f} no_limit≈{no_limit_est:.4f}\n"
-                                    )
-                                    + (
-                                        f"yes_filled_size={getattr(res, 'yes_filled_size', None)} | "
-                                        f"no_filled_size={getattr(res, 'no_filled_size', None)}\n"
-                                    )
-                                    + (
-                                        f"timings: detect→submit={f'{detect_to_send_ms:.1f}ms' if detect_to_send_ms is not None else 'n/a'} | "
-                                        f"submit→ack={f'{submit_to_ack_ms:.1f}ms' if submit_to_ack_ms is not None else 'n/a'} | "
-                                        f"exec_call={call_ms:.1f}ms\n"
-                                    )
-                                    + (f"balance/allowance={bal_summary}\n" if bal_summary else "")
-                                ),
                                 run_id=run_id,
-                                status=res.status if res.status in {"SUBMITTED","WAITING","FILLED","CANCELLED","FAILED"} else "FAILED",
+                                status=final_status,
+                                extra_fields=extra,
                             )
 
                         asyncio.create_task(_real_execute_and_report(), name=f"exec-real-{opp.market_id}")

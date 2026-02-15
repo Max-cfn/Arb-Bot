@@ -139,6 +139,7 @@ class DiscordClient:
         *,
         run_id: str = "",
         status: str = "PLANNED",
+        extra_fields: list[dict] | None = None,
     ) -> bool:
         """Send execution status to the appropriate Discord channel.
 
@@ -149,7 +150,7 @@ class DiscordClient:
 
         Fallback chain: executions_info → executions → ops.
         """
-        payload = format_execution_embed(opp, note=note, run_id=run_id, status=status)
+        payload = format_execution_embed(opp, note=note, run_id=run_id, status=status, extra_fields=extra_fields)
         normalized = str(status).upper().strip()
 
         is_priority = normalized in {
