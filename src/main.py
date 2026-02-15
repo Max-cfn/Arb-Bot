@@ -34,8 +34,8 @@ DAILY_SUMMARY_HOUR = 8       # 08:00 UTC
 DB_PURGE_INTERVAL = 3600     # 1 hour
 
 # Debug: send periodic WS/OB stats to OPS to validate stream end-to-end
-DEBUG_OPS_INTERVAL = 60      # 1 min
-WS_PROBE_ON_START = True
+DEBUG_OPS_INTERVAL = 300     # 5 min
+WS_PROBE_ON_START = os.getenv("WS_PROBE_ON_START", "0").strip() in {"1", "true", "yes"}
 WS_PROBE_TIMEOUT_S = 6.0
 WS_PROBE_MAX_MSGS = 4
 
@@ -682,9 +682,11 @@ async def periodic_ops_debug(
     ob_manager: OrderbookManager,
     start_time: float,
 ) -> None:
-    """Send periodic debug stats to OPS (low frequency).
+    """Periodic WS/OB health stats.
 
-    Useful to validate whether WebSocket book updates are actually flowing.
+    - Always logs to stdout (logger).
+    - Only sends to Discord OPS when an anomaly is detected (stale books, no
+      recent updates) to avoid spamming the channel with routine heartbeats.
     """
     # Small delay to let the bot connect first
     await asyncio.sleep(10)
@@ -699,21 +701,31 @@ async def periodic_ops_debug(
             m, s = divmod(rem, 60)
 
             newest_age = int(now - stats.get("newest_update", 0.0)) if stats.get("newest_update") else None
-            oldest_age = int(now - stats.get("oldest_update", 0.0)) if stats.get("oldest_update") else None
+            stale_books = int(stats.get("stale_books") or 0)
+            tracked_assets = stats.get("tracked_assets", 0)
 
-            # Keep OPS readable: summary only (no recent asset list / raw edges).
-            lines = []
-            lines.append(f"WS/OB debug | uptime={h:02d}h{m:02d}m{s:02d}s")
-            lines.append(
-                f"tracked_assets={stats.get('tracked_assets')} total_markets={stats.get('total_markets')} stale_books={stats.get('stale_books')}"
+            # Always log locally
+            logger.info(
+                "OPS_DEBUG uptime=%02dh%02dm%02ds tracked=%s total_markets=%s stale=%s newest_age=%s",
+                h, m, s, tracked_assets, stats.get("total_markets"), stale_books,
+                f"{newest_age}s" if newest_age is not None else "n/a",
             )
-            if newest_age is not None:
-                lines.append(f"newest_book_age={newest_age}s")
-            if oldest_age is not None:
-                lines.append(f"oldest_book_age={oldest_age}s")
 
-            msg = "\n".join(lines)
-            await discord.send_ops(msg)
+            # Only Discord-alert on anomalies:
+            # - No book update in >120s (stream may be dead)
+            # - More than 10 stale books
+            stream_stale = newest_age is not None and newest_age > 120
+            too_many_stale = stale_books > 10
+
+            if stream_stale or too_many_stale:
+                lines = [f"WS/OB ANOMALY | uptime={h:02d}h{m:02d}m{s:02d}s"]
+                if stream_stale:
+                    lines.append(f"ALERT: no book update for {newest_age}s — stream may be dead")
+                if too_many_stale:
+                    lines.append(f"ALERT: {stale_books} stale books (>{10} threshold)")
+                lines.append(f"tracked_assets={tracked_assets} total_markets={stats.get('total_markets')}")
+                await discord.send_ops("\n".join(lines))
+
         except Exception as exc:
             logger.error("OPS debug failed: %s", exc)
 
@@ -1227,8 +1239,14 @@ async def main() -> None:
         await discord.send_ops(f"WebSocket error: {exc}")
 
     async def on_ws_debug(msg: str) -> None:
-        # Keep debug visible in the OPS channel
-        await discord.send_ops(msg)
+        # Only log to Discord if it looks like an error/warning, not routine debug noise.
+        # Routine WS debug messages (raw samples, reconnect counts) would spam OPS.
+        msg_lower = msg.lower()
+        is_notable = any(k in msg_lower for k in ("error", "fail", "exception", "disconnect", "reconnect", "timeout", "closed"))
+        if is_notable:
+            await discord.send_ops(msg)
+        else:
+            logger.debug("WS_DEBUG (suppressed from Discord): %s", msg[:200])
 
     # --- WebSocket client ---
     asset_ids = extract_all_token_ids(markets)

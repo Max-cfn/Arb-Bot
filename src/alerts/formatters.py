@@ -262,111 +262,114 @@ def format_execution_embed(
     run_id: str = "",
     status: str = "PLANNED",
 ) -> dict[str, Any]:
-    """Format a Detailed Execution Message.
-    
+    """Format a detailed execution message for Discord.
+
     Status Types:
-    - PLANNED/SUBMITTED: Order placement details.
-    - FILLED/SUCCESS: Success confirmation.
-    - FAILED/CANCELLED: Failure/Cancellation details.
-    - PAYOUT: Payout received (future use).
+    - SUBMITTED / PLACED / SENDING  → order just sent
+    - FILLED / SUCCESS / COMPLETED  → both legs confirmed filled
+    - FAILED / CANCELLED / REJECTED → order failed or unwound
+    - WAITING                        → polling for fill
+    - PAYOUT / CLAIMED               → future use
     """
-    
+
     url = f"https://polymarket.com/market/{opp.slug}" if getattr(opp, "slug", "") else ""
-    
-    # Defaults
-    color = EMBED_COLORS["info"]
-    title_prefix = "ℹ️ Execution Update"
-    
     s_upper = status.upper()
-    
+
+    # ── colours & titles ──────────────────────────────────────────────────────
     if s_upper in ("SUBMITTED", "PLACED", "SENDING"):
         color = EMBED_COLORS["execution_sub"]
-        title_prefix = "🛒 Order Placed"
+        title_prefix = "Order Submitted (FOK)"
+        content_ping = ""
     elif s_upper in ("FILLED", "SUCCESS", "COMPLETED"):
         color = EMBED_COLORS["execution_fill"]
-        title_prefix = "✅ Order Filled"
+        title_prefix = "FILLED"
+        content_ping = "@here "          # always ping on success
     elif s_upper in ("FAILED", "CANCELLED", "REJECTED", "ERROR"):
         color = EMBED_COLORS["execution_fail"]
-        title_prefix = "❌ Order Failed/Cancelled"
+        title_prefix = "Order Failed / Cancelled"
+        content_ping = ""
     elif s_upper in ("PAYOUT", "CLAIMED"):
         color = EMBED_COLORS["execution_payout"]
-        title_prefix = "💰 Payout Received"
+        title_prefix = "Payout Received"
+        content_ping = ""
     elif s_upper == "WAITING":
         color = EMBED_COLORS["warning"]
-        title_prefix = "⏳ Waiting for Fill"
+        title_prefix = "Waiting for Fill"
+        content_ping = ""
+    else:
+        color = EMBED_COLORS["info"]
+        title_prefix = "Execution Update"
+        content_ping = ""
 
     title = f"{title_prefix} | {s_upper}"
-    
-    # Common Fields
-    fields = []
-    
-    # 1. Market Info
-    fields.append({
-        "name": "Market",
-        "value": f"[{opp.market_question}]({url})\nID: `{str(opp.market_id)[:16]}...`",
-        "inline": False
-    })
-    
+
+    # ── fields ────────────────────────────────────────────────────────────────
+    fields: list[dict[str, Any]] = []
+
+    # 1. Market
+    market_val = f"[{opp.market_question[:200]}]({url})" if url else opp.market_question[:200]
+    market_val += f"\nID: `{str(opp.market_id)[:20]}`"
+    fields.append({"name": "Market", "value": market_val, "inline": False})
+
     # 2. Strategy / Edge
     fields.append({
-        "name": "Strategy",
-        "value": f"Net Edge: **{opp.net_edge_percent:.2f}%**\nEst. Profit: ${opp.one_share_net_profit:.4f}/share",
-        "inline": True
-    })
-    
-    # 3. Order Details (What are we buying?)
-    # Assuming standard arb: Buy YES + Buy NO
-    fields.append({
-        "name": "Orders (Limit)",
+        "name": "Edge",
         "value": (
-            f"🟢 **BUY YES** @ ${opp.yes_best_ask:.4f}\n"
-            f"🔴 **BUY NO**  @ ${opp.no_best_ask:.4f}\n"
-            f"Total Cost: ${opp.combined_best_asks:.4f}"
+            f"Net: **{opp.net_edge_percent:.2f}%**\n"
+            f"Gross: {opp.gross_edge_percent:.2f}%\n"
+            f"Est. profit: **${float(getattr(opp, 'one_share_net_profit', 0) or 0):.4f}**/share"
         ),
-        "inline": True
+        "inline": True,
     })
 
-    # 4. Status Specifics
-    if s_upper in ("SUBMITTED", "PLACED"):
+    # 3. Orders
+    yes_ask = float(getattr(opp, "yes_best_ask", 0) or 0)
+    no_ask = float(getattr(opp, "no_best_ask", 0) or 0)
+    combined = float(getattr(opp, "combined_best_asks", yes_ask + no_ask) or (yes_ask + no_ask))
+    fields.append({
+        "name": "Orders (FOK limit)",
+        "value": (
+            f"BUY YES @ ${yes_ask:.4f}\n"
+            f"BUY NO  @ ${no_ask:.4f}\n"
+            f"Combined: ${combined:.4f}"
+        ),
+        "inline": True,
+    })
+
+    # 4. Status-specific detail
+    if s_upper in ("SUBMITTED", "PLACED", "SENDING"):
         fields.append({
             "name": "Status",
-            "value": "Orders submitted to CLOB. Waiting for confirmation...",
-            "inline": False
+            "value": "FOK orders sent. Will auto-cancel if not filled immediately.",
+            "inline": False,
         })
-    elif s_upper == "FILLED":
+    elif s_upper in ("FILLED", "SUCCESS", "COMPLETED"):
         fields.append({
-            "name": "Execution Result",
-            "value": "✅ **Both legs filled.** Position secured.",
-            "inline": False
+            "name": "Result",
+            "value": "**Both legs filled.** Arbitrage position locked.",
+            "inline": False,
         })
-    elif s_upper in ("FAILED", "CANCELLED"):
+    elif s_upper in ("FAILED", "CANCELLED", "REJECTED", "ERROR"):
         fields.append({
-            "name": "Failure Reason",
-            "value": note if note else "Unknown error or timeout.",
-            "inline": False
+            "name": "Reason",
+            "value": (note[:1000] if note else "Unknown error or timeout."),
+            "inline": False,
         })
     elif s_upper == "PAYOUT":
         fields.append({
-            "name": "Payout Details",
-            "value": note if note else "Funds claimed successfully.",
-            "inline": False
+            "name": "Payout",
+            "value": (note[:1000] if note else "Funds claimed."),
+            "inline": False,
         })
 
-    # 5. Technical / Debug Info
-    footer_text = f"Run ID: {run_id}" if run_id else f"Market: {str(opp.market_id)[:10]}"
-    if note and s_upper not in ("FAILED", "CANCELLED", "PAYOUT"):
-        # If note wasn't used in main body, add it to footer or description
-        pass # simplified for cleaner look, or could add field
+    # 5. Note (extra detail / timings — only for non-error statuses where note wasn't consumed)
+    if note and s_upper not in ("FAILED", "CANCELLED", "REJECTED", "ERROR", "PAYOUT"):
+        fields.append({"name": "Detail", "value": note[:1000], "inline": False})
 
-    # Extra note field if provided and not already consumed
-    if note and s_upper not in ("FAILED", "CANCELLED", "PAYOUT"):
-         fields.append({
-            "name": "Note",
-            "value": note,
-            "inline": False
-        })
+    footer_text = f"Run: {run_id}" if run_id else f"Market: {str(opp.market_id)[:12]}"
 
     return {
+        "content": f"{content_ping}**{title}**" if content_ping else None,
         "embeds": [
             {
                 "title": title,
@@ -376,7 +379,7 @@ def format_execution_embed(
                 "footer": {"text": footer_text},
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-        ]
+        ],
     }
 
 

@@ -19,8 +19,9 @@ from src.config import Config
 from src.detector.base import ArbitrageOpportunity
 from src.utils.logger import logger
 
-# Rate-limit: Discord allows ~30 requests/min per webhook
-RATE_LIMIT_DELAY = 2.0  # seconds between sends
+# Rate-limit: Discord allows ~30 requests/min per webhook (~2s between sends is safe).
+# Priority messages (FILLED, SUBMITTED, CANCELLED, etc.) bypass this local pacing.
+RATE_LIMIT_DELAY = 2.0  # seconds between sends for non-priority messages
 
 
 class DiscordClient:
@@ -108,21 +109,32 @@ class DiscordClient:
         run_id: str = "",
         status: str = "PLANNED",
     ) -> bool:
-        """Send a dry-run execution plan (or later real execution status)."""
+        """Send execution status to the appropriate Discord channel.
+
+        Priority (no rate-limit delay) for:
+        - SUBMITTED / PLACED / SENDING — order just sent, time-sensitive
+        - FILLED / SUCCESS / COMPLETED — trade confirmed, must never be lost
+        - CANCELLED / FAILED           — also priority so unwind events surface fast
+        """
         payload = format_execution_embed(opp, note=note, run_id=run_id, status=status)
         normalized = str(status).upper().strip()
-        # SUBMITTED is time-sensitive.
-        is_priority = normalized in {"SUBMITTED", "PLACED", "SENDING"}
+
+        # All execution events that have financial consequence are priority.
+        is_priority = normalized in {
+            "SUBMITTED", "PLACED", "SENDING",
+            "FILLED", "SUCCESS", "COMPLETED",
+            "CANCELLED", "FAILED", "REJECTED", "ERROR",
+        }
 
         error_statuses = {"FAILED", "CANCELLED", "REJECTED", "ERROR"}
         target = "executions" if normalized in error_statuses else "executions_info"
 
-        # Backward-compatible fallback chain.
+        # Backward-compatible fallback chain: try primary channel, then executions, then ops.
         ok = await self._send(target, payload, priority=is_priority)
         if not ok and target == "executions_info":
             ok = await self._send("executions", payload, priority=is_priority)
         if not ok:
-            return await self._send("ops", payload, priority=is_priority)
+            ok = await self._send("ops", payload, priority=is_priority)
         return ok
 
     async def send_health(self, status: str, details: dict[str, Any] | None = None) -> bool:
