@@ -16,7 +16,8 @@ class Config:
     discord_webhook_ops: str = ""
     discord_webhook_daily: str = ""
     discord_webhook_opportunities: str = ""
-    discord_webhook_executions: str = ""
+    discord_webhook_executions: str = ""  # errors / failures
+    discord_webhook_executions_info: str = ""  # submitted / filled / cashout style updates
 
     # Detection params
     min_edge_percent: float = 0.5
@@ -70,6 +71,7 @@ def load_config(env_path: str | None = None) -> Config:
         discord_webhook_daily=os.getenv("DISCORD_WEBHOOK_DAILY", ""),
         discord_webhook_opportunities=os.getenv("DISCORD_WEBHOOK_OPPORTUNITIES", ""),
         discord_webhook_executions=os.getenv("DISCORD_WEBHOOK_EXECUTIONS", ""),
+        discord_webhook_executions_info=os.getenv("DISCORD_WEBHOOK_EXECUTIONS_INFO", ""),
         min_edge_percent=float(os.getenv("MIN_EDGE_PERCENT", "0.5")),
         min_liquidity_usd=float(os.getenv("MIN_LIQUIDITY_USD", "100")),
         max_markets_watch=int(os.getenv("MAX_MARKETS_WATCH", "500")),

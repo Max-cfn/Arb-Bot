@@ -32,7 +32,8 @@ class DiscordClient:
             "ops": config.discord_webhook_ops,
             "daily": config.discord_webhook_daily,
             "opportunities": config.discord_webhook_opportunities,
-            "executions": config.discord_webhook_executions,
+            "executions": config.discord_webhook_executions,  # errors
+            "executions_info": config.discord_webhook_executions_info,
         }
         self._last_send: float = 0
         self._last_send_by_webhook: dict[str, float] = {}
@@ -109,11 +110,17 @@ class DiscordClient:
     ) -> bool:
         """Send a dry-run execution plan (or later real execution status)."""
         payload = format_execution_embed(opp, note=note, run_id=run_id, status=status)
-        # SUBMITTED is time-sensitive: prioritize delivery in executions webhook.
-        is_priority = str(status).upper() in {"SUBMITTED", "PLACED", "SENDING"}
+        normalized = str(status).upper().strip()
+        # SUBMITTED is time-sensitive.
+        is_priority = normalized in {"SUBMITTED", "PLACED", "SENDING"}
 
-        # Prefer executions channel if configured; otherwise fall back to ops.
-        ok = await self._send("executions", payload, priority=is_priority)
+        error_statuses = {"FAILED", "CANCELLED", "REJECTED", "ERROR"}
+        target = "executions" if normalized in error_statuses else "executions_info"
+
+        # Backward-compatible fallback chain.
+        ok = await self._send(target, payload, priority=is_priority)
+        if not ok and target == "executions_info":
+            ok = await self._send("executions", payload, priority=is_priority)
         if not ok:
             return await self._send("ops", payload, priority=is_priority)
         return ok
