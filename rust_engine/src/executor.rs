@@ -318,17 +318,60 @@ impl FastExecutor {
         let yes_oid = yes_order_id.unwrap();
         let no_oid = no_order_id.unwrap();
 
-        let (yes_status, no_status) = tokio::join!(
-            self.get_order_status(&yes_oid),
-            self.get_order_status(&no_oid),
-        );
+        // -----------------------------------------------------------------
+        // Phase 2 — Poll until both legs reach a terminal state (up to 500ms).
+        // A single get_order_status call is a race against the exchange matching
+        // engine: if the order is still in-flight the response will be empty.
+        // We must keep polling until we see a terminal state on each leg.
+        // -----------------------------------------------------------------
+        let poll_interval = Duration::from_millis(25);
+        let poll_deadline = Instant::now() + Duration::from_millis(500);
 
-        let (yes_state, yes_filled, yes_final_price) = yes_status.unwrap_or_default();
-        let (no_state, no_filled, no_final_price) = no_status.unwrap_or_default();
+        let mut yes_state = String::new();
+        let mut yes_filled = 0.0f64;
+        let mut yes_final_price = 0.0f64;
+        let mut no_state = String::new();
+        let mut no_filled = 0.0f64;
+        let mut no_final_price = 0.0f64;
+        let mut yes_terminal = false;
+        let mut no_terminal = false;
 
-        let yes_full = yes_filled + 0.000001 >= shares as f64 && is_done(&yes_state);
-        let no_full = no_filled + 0.000001 >= shares as f64 && is_done(&no_state);
+        while Instant::now() < poll_deadline {
+            // Only poll legs that have not yet reached a terminal state.
+            let (yes_s, no_s) = tokio::join!(
+                async {
+                    if yes_terminal { None } else { self.get_order_status(&yes_oid).await }
+                },
+                async {
+                    if no_terminal { None } else { self.get_order_status(&no_oid).await }
+                },
+            );
 
+            if let Some((st, sz, px)) = yes_s {
+                // Keep max filled size seen across polls (fills are monotonic).
+                if sz > yes_filled { yes_filled = sz; }
+                if px > 0.0 { yes_final_price = px; }
+                yes_state = st;
+                yes_terminal = is_done(&yes_state);
+            }
+            if let Some((st, sz, px)) = no_s {
+                if sz > no_filled { no_filled = sz; }
+                if px > 0.0 { no_final_price = px; }
+                no_state = st;
+                no_terminal = is_done(&no_state);
+            }
+
+            // Both legs terminal → no need to wait longer.
+            if yes_terminal && no_terminal {
+                break;
+            }
+            sleep(poll_interval).await;
+        }
+
+        let yes_full = yes_filled + 0.000001 >= shares as f64 && yes_terminal;
+        let no_full = no_filled + 0.000001 >= shares as f64 && no_terminal;
+
+        // Happy path: both legs filled completely.
         if yes_full && no_full {
             return make_terminal_result(
                 "FILLED",
@@ -355,8 +398,245 @@ impl FastExecutor {
             );
         }
 
-        // Unexpected partial under FOK: force cancel and fail closed.
-        let _ = self.cancel_orders(&[&yes_oid, &no_oid]).await;
+        // -----------------------------------------------------------------
+        // Phase 3 — Recovery: cancel open orders, then try to complete the
+        // arb or safely unwind any one-sided fill.
+        // -----------------------------------------------------------------
+
+        // Cancel both legs.  Ignore errors: a filled FOK order cannot be
+        // cancelled and the exchange will return an error — that is expected.
+        let cancel_result = self.cancel_orders(&[&yes_oid, &no_oid]).await;
+        if let Err(ref e) = cancel_result {
+            error!(
+                "cancel attempt run={} err={} (a leg may already be filled)",
+                run_id, e
+            );
+        }
+
+        // Brief pause so the exchange can update statuses after the cancel.
+        sleep(Duration::from_millis(80)).await;
+
+        // Re-fetch terminal statuses after cancel to get accurate fill sizes.
+        let (yes_s2, no_s2) = tokio::join!(
+            self.get_order_status(&yes_oid),
+            self.get_order_status(&no_oid),
+        );
+        if let Some((st, sz, px)) = yes_s2 {
+            if sz > yes_filled { yes_filled = sz; }
+            if px > 0.0 { yes_final_price = px; }
+            yes_state = st;
+        }
+        if let Some((st, sz, px)) = no_s2 {
+            if sz > no_filled { no_filled = sz; }
+            if px > 0.0 { no_final_price = px; }
+            no_state = st;
+        }
+
+        let yes_has_fill = yes_filled > 0.0;
+        let no_has_fill = no_filled > 0.0;
+
+        // Case A: both partially/fully filled after cancel re-check.
+        if yes_has_fill && no_has_fill {
+            return make_terminal_result(
+                "FILLED",
+                &run_id,
+                &opp.market_id,
+                Some(yes_oid),
+                Some(no_oid),
+                format!(
+                    "RECOVERY_BOTH_FILLED yes_filled={:.4} no_filled={:.4}",
+                    yes_filled, no_filled
+                ),
+                "RECOVERY_BOTH_FILLED",
+                yes_filled,
+                no_filled,
+                yes_price,
+                no_price,
+                yes_final_price,
+                no_final_price,
+                sign_ms,
+                submit_ms,
+                detect_to_sign_ms,
+                detect_to_submit_ms,
+                t_start.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+
+        // Case B: exactly one leg filled → attempt FAK retry on the unfilled leg.
+        if yes_has_fill && !no_has_fill {
+            info!(
+                "recovery: YES filled ({:.4}) NO empty — FAK retry on NO run={}",
+                yes_filled, run_id
+            );
+            let retry_ok = self
+                .retry_buy(
+                    &opp.no_token_id,
+                    no_price,
+                    yes_filled,   // match the actual YES fill size
+                    no_fee_bps,
+                    no_neg_risk,
+                    Duration::from_millis(25),
+                    200,
+                    &run_id,
+                )
+                .await;
+
+            if retry_ok {
+                return make_terminal_result(
+                    "FILLED",
+                    &run_id,
+                    &opp.market_id,
+                    Some(yes_oid),
+                    Some(no_oid),
+                    format!("PARTIAL_RETRY_SUCCESS YES filled NO retried={:.4}", yes_filled),
+                    "PARTIAL_RETRY_SUCCESS",
+                    yes_filled,
+                    yes_filled,   // NO leg filled same size
+                    yes_price,
+                    no_price,
+                    yes_final_price,
+                    no_final_price,
+                    sign_ms,
+                    submit_ms,
+                    detect_to_sign_ms,
+                    detect_to_submit_ms,
+                    t_start.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+
+            // FAK retry failed → emergency market-sell of YES leg.
+            error!(
+                "recovery: FAK retry failed — emergency unwind YES={:.4} run={}",
+                yes_filled, run_id
+            );
+            let unwind_ok = self
+                .unwind_sell(
+                    &opp.yes_token_id,
+                    yes_filled,
+                    yes_price,
+                    yes_neg_risk,
+                    yes_fee_bps,
+                    yes_tick,
+                    5.0,
+                )
+                .await;
+            let rc = if unwind_ok {
+                "FOK_EMERGENCY_UNWIND_OK"
+            } else {
+                "FOK_EMERGENCY_UNWIND_FAILED"
+            };
+            return make_terminal_result(
+                "CANCELLED",
+                &run_id,
+                &opp.market_id,
+                Some(yes_oid),
+                Some(no_oid),
+                format!(
+                    "{rc} yes_state={yes_state} yes_filled={yes_filled:.6} \
+                     no_state={no_state} no_filled={no_filled:.6}"
+                ),
+                rc,
+                yes_filled,
+                no_filled,
+                yes_price,
+                no_price,
+                yes_final_price,
+                no_final_price,
+                sign_ms,
+                submit_ms,
+                detect_to_sign_ms,
+                detect_to_submit_ms,
+                t_start.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+
+        if no_has_fill && !yes_has_fill {
+            info!(
+                "recovery: NO filled ({:.4}) YES empty — FAK retry on YES run={}",
+                no_filled, run_id
+            );
+            let retry_ok = self
+                .retry_buy(
+                    &opp.yes_token_id,
+                    yes_price,
+                    no_filled,
+                    yes_fee_bps,
+                    yes_neg_risk,
+                    Duration::from_millis(25),
+                    200,
+                    &run_id,
+                )
+                .await;
+
+            if retry_ok {
+                return make_terminal_result(
+                    "FILLED",
+                    &run_id,
+                    &opp.market_id,
+                    Some(yes_oid),
+                    Some(no_oid),
+                    format!("PARTIAL_RETRY_SUCCESS NO filled YES retried={:.4}", no_filled),
+                    "PARTIAL_RETRY_SUCCESS",
+                    no_filled,
+                    no_filled,
+                    yes_price,
+                    no_price,
+                    yes_final_price,
+                    no_final_price,
+                    sign_ms,
+                    submit_ms,
+                    detect_to_sign_ms,
+                    detect_to_submit_ms,
+                    t_start.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+
+            error!(
+                "recovery: FAK retry failed — emergency unwind NO={:.4} run={}",
+                no_filled, run_id
+            );
+            let unwind_ok = self
+                .unwind_sell(
+                    &opp.no_token_id,
+                    no_filled,
+                    no_price,
+                    no_neg_risk,
+                    no_fee_bps,
+                    no_tick,
+                    5.0,
+                )
+                .await;
+            let rc = if unwind_ok {
+                "FOK_EMERGENCY_UNWIND_OK"
+            } else {
+                "FOK_EMERGENCY_UNWIND_FAILED"
+            };
+            return make_terminal_result(
+                "CANCELLED",
+                &run_id,
+                &opp.market_id,
+                Some(yes_oid),
+                Some(no_oid),
+                format!(
+                    "{rc} yes_state={yes_state} yes_filled={yes_filled:.6} \
+                     no_state={no_state} no_filled={no_filled:.6}"
+                ),
+                rc,
+                yes_filled,
+                no_filled,
+                yes_price,
+                no_price,
+                yes_final_price,
+                no_final_price,
+                sign_ms,
+                submit_ms,
+                detect_to_sign_ms,
+                detect_to_submit_ms,
+                t_start.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+
+        // Case C: neither leg has any fill.
         make_terminal_result(
             "CANCELLED",
             &run_id,
@@ -364,10 +644,10 @@ impl FastExecutor {
             Some(yes_oid),
             Some(no_oid),
             format!(
-                "FOK_PARTIAL_DETECTED yes_state={} yes_filled={:.6} no_state={} no_filled={:.6}",
+                "FOK_NO_FILLS yes_state={} yes_filled={:.6} no_state={} no_filled={:.6}",
                 yes_state, yes_filled, no_state, no_filled,
             ),
-            "FOK_PARTIAL_DETECTED",
+            "FOK_NO_FILLS",
             yes_filled,
             no_filled,
             yes_price,
