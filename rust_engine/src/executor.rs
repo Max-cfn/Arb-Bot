@@ -3,7 +3,7 @@
 //! Three-phase execution with complete-or-abort safety:
 //!   Phase 1 — Sign + POST both legs in parallel (hot path, ~50ms)
 //!   Phase 2 — Poll for fills (up to 500ms)
-//!   Phase 3 — Recovery: cancel open → retry failed leg → unwind if needed
+//!   Phase 3 — Recovery: cancel open → market-unwind any one-sided fill
 //!
 //! Uses k256 directly for ECDSA signing (avoids alloy-signer-local and its
 //! broken alloy-consensus transitive dependency chain).
@@ -192,8 +192,8 @@ impl FastExecutor {
         };
         let sign_ms = t_sign_start.elapsed().as_secs_f64() * 1000.0;
 
-        let yes_body = self.build_post_body(&yes_order, &yes_sig, "GTC");
-        let no_body = self.build_post_body(&no_order, &no_sig, "GTC");
+        let yes_body = self.build_post_body(&yes_order, &yes_sig, "FOK");
+        let no_body = self.build_post_body(&no_order, &no_sig, "FOK");
 
         let t_submit = Instant::now();
         let (yes_resp, no_resp) = tokio::join!(
@@ -366,10 +366,10 @@ impl FastExecutor {
             if diff.abs() > 0.001 {
                 if diff > 0.0 {
                     info!("executor: trimming excess YES {:.4} run={}", diff, run_id);
-                    let _ = self.unwind_sell(&opp.yes_token_id, diff, yes_price, yes_neg_risk, yes_fee_bps, yes_tick, config.unwind_max_loss_pct).await;
+                    let _ = self.unwind_sell(&opp.yes_token_id, diff, yes_price, yes_neg_risk, yes_fee_bps, config.unwind_max_loss_pct).await;
                 } else {
                     info!("executor: trimming excess NO {:.4} run={}", -diff, run_id);
-                    let _ = self.unwind_sell(&opp.no_token_id, -diff, no_price, no_neg_risk, no_fee_bps, no_tick, config.unwind_max_loss_pct).await;
+                    let _ = self.unwind_sell(&opp.no_token_id, -diff, no_price, no_neg_risk, no_fee_bps, config.unwind_max_loss_pct).await;
                 }
             }
             let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
@@ -400,66 +400,19 @@ impl FastExecutor {
             };
         }
 
-        // ----- Case B: One-sided fill → retry other leg, then unwind if retry fails -----
+        // ----- Case B: One-sided fill → immediate unwind -----
         if (yes_filled > 0.0) != (no_filled > 0.0) {
-            let (filled_label, filled_token, filled_size, filled_price, filled_neg_risk, filled_fee_bps, filled_tick,
-                 other_token, other_price, other_neg_risk, other_fee_bps, other_tick) =
+            let (filled_label, filled_token, filled_size, filled_price, filled_neg_risk, filled_fee_bps) =
                 if yes_filled > 0.0 {
-                    ("YES", &opp.yes_token_id, yes_filled, yes_price,
-                     yes_neg_risk, yes_fee_bps, yes_tick,
-                     &opp.no_token_id, no_price, no_neg_risk, no_fee_bps, no_tick)
+                    ("YES", &opp.yes_token_id, yes_filled, yes_price, yes_neg_risk, yes_fee_bps)
                 } else {
-                    ("NO", &opp.no_token_id, no_filled, no_price,
-                     no_neg_risk, no_fee_bps, no_tick,
-                     &opp.yes_token_id, yes_price, yes_neg_risk, yes_fee_bps, yes_tick)
+                    ("NO", &opp.no_token_id, no_filled, no_price, no_neg_risk, no_fee_bps)
                 };
 
-            info!("executor: one-sided fill {}={:.4}, retrying other leg run={}", filled_label, filled_size, run_id);
-
-            // Retry: buy the other leg with slippage, FAK order type
-            let retry_price = round_to_tick(
-                (other_price * (1.0 + config.retry_slippage_pct / 100.0)).min(0.9999).max(0.0001),
-                other_tick,
-            );
-            let retry_ok = self.retry_buy(
-                other_token, retry_price, filled_size, other_fee_bps,
-                other_neg_risk, poll_interval, config.retry_duration_ms, &run_id,
-            ).await;
-
-            if retry_ok {
-                let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
-                info!("executor: FILLED(retry) run={} total={:.1}ms", run_id, total_ms);
-                return RustExecutionResult {
-                    status: "FILLED".into(),
-                    run_id,
-                    market_id: opp.market_id.clone(),
-                    yes_order_id: Some(yes_oid),
-                    no_order_id: Some(no_oid),
-                    reason: format!(
-                        "PARTIAL_RETRY_SUCCESS {}_filled={:.4}{}{}",
-                        filled_label,
-                        filled_size,
-                        timing_since_detect("detect_to_sign"),
-                        timing_since_detect("detect_to_submit"),
-                    ),
-                    reason_code: Some("PARTIAL_RETRY_SUCCESS".into()),
-                    yes_filled_size: if yes_filled > 0.0 { yes_filled } else { filled_size },
-                    no_filled_size: if no_filled > 0.0 { no_filled } else { filled_size },
-                    yes_target_price: yes_price,
-                    no_target_price: no_price,
-                    yes_final_price,
-                    no_final_price,
-                    sign_ms,
-                    submit_ms,
-                    total_ms,
-                };
-            }
-
-            // Retry failed → unwind the filled leg
-            warn!("executor: retry failed, unwinding {} run={}", filled_label, run_id);
+            warn!("executor: one-sided fill {}={:.4}, unwinding run={}", filled_label, filled_size, run_id);
             let unwind_ok = self.unwind_sell(
                 filled_token, filled_size, filled_price,
-                filled_neg_risk, filled_fee_bps, filled_tick,
+                filled_neg_risk, filled_fee_bps,
                 config.unwind_max_loss_pct,
             ).await;
 
@@ -525,45 +478,7 @@ impl FastExecutor {
     // Recovery helpers
     // =====================================================================
 
-    /// Attempt to buy the other leg with FAK. Returns true if filled.
-    async fn retry_buy(
-        &self,
-        token_id: &str,
-        price: f64,
-        size: f64,
-        fee_rate_bps: u32,
-        neg_risk: bool,
-        poll_interval: Duration,
-        retry_duration_ms: u64,
-        run_id: &str,
-    ) -> bool {
-        let order = self.build_order(token_id, price, size, fee_rate_bps, BUY);
-        let sig = match self.sign_order(&order, neg_risk) {
-            Ok(s) => s,
-            Err(e) => { error!("retry sign failed: {} run={}", e, run_id); return false; }
-        };
-        let body = self.build_post_body(&order, &sig, "FAK");
-        let resp = match self.post_order(&body).await {
-            Ok(v) => v,
-            Err(e) => { error!("retry POST failed: {} run={}", e, run_id); return false; }
-        };
-        let retry_oid = match extract_order_id(&resp) {
-            Some(id) => id,
-            None => { error!("retry: no orderID in response run={}", run_id); return false; }
-        };
-
-        let deadline = Instant::now() + Duration::from_millis(retry_duration_ms);
-        while Instant::now() < deadline {
-            if let Some((st, sz, _px)) = self.get_order_status(&retry_oid).await {
-                if is_done(&st) && sz > 0.0 { return true; }
-                if is_done(&st) { return false; } // terminal but no fill
-            }
-            sleep(poll_interval).await;
-        }
-        false
-    }
-
-    /// Sell shares to unwind a one-sided position. Uses FAK at loss-capped price.
+    /// Sell shares to unwind a one-sided position. Uses marketable FAK with loss cap.
     async fn unwind_sell(
         &self,
         token_id: &str,
@@ -571,14 +486,12 @@ impl FastExecutor {
         buy_price: f64,
         neg_risk: bool,
         fee_rate_bps: u32,
-        tick_size: &str,
         max_loss_pct: f64,
     ) -> bool {
         if shares <= 0.0 { return false; }
 
-        // Floor price = buy_price minus max acceptable loss
-        let min_price = (buy_price * (1.0 - max_loss_pct / 100.0)).max(0.0001);
-        let sell_price = round_to_tick(min_price, tick_size);
+        // Marketable FAK sell while respecting max loss cap.
+        let sell_price = (buy_price * (1.0 - max_loss_pct / 100.0)).max(0.0001);
 
         let order = self.build_order(token_id, sell_price, shares, fee_rate_bps, SELL);
         let sig = match self.sign_order(&order, neg_risk) {
