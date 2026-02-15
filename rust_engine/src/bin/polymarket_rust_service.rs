@@ -264,6 +264,21 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Spawn a background task that refreshes the USDC balance every 10 s.
+    // The executor reads the cached value as a free atomic load in the hot path —
+    // zero network cost when checking whether we have enough funds.
+    if let Some(exec) = &executor {
+        let exec_bal = Arc::clone(exec);
+        // Immediate first fetch so the guard is populated before any trade.
+        exec_bal.refresh_balance().await;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                exec_bal.refresh_balance().await;
+            }
+        });
+    }
+
     let (tx, mut rx) = mpsc::unbounded_channel::<WsEvent>();
     let ws_url = cfg.ws_url.clone();
     let obm_ws = Arc::clone(&obm);
@@ -319,7 +334,12 @@ async fn main() -> Result<()> {
                             let mc = Arc::clone(&meta_cache);
                             tokio::spawn(async move {
                                 let res = exec.execute(&opp, &cfg2, &mc).await;
-                                if res.status != "SUBMITTED" {
+                                // Refresh balance after any trade attempt (fills or errors
+                                // both change the usable balance).
+                                if res.status != "SKIPPED" {
+                                    exec.refresh_balance().await;
+                                }
+                                if res.status != "SUBMITTED" && res.status != "SKIPPED" {
                                     warn!("exec status={} reason={}", res.status, res.reason);
                                 }
                             });
