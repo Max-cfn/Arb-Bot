@@ -9,6 +9,8 @@
 //! broken alloy-consensus transitive dependency chain).
 
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address, B256, U256};
@@ -72,6 +74,9 @@ pub struct FastExecutor {
     chain_id: u64,
     signature_type: u32,
     clob_base_url: String,
+    /// Cached USDC collateral balance in micro-units (1 USDC = 1_000_000).
+    /// Refreshed by `refresh_balance()` — reads in the hot path are free (atomic).
+    pub balance_usdc: Arc<AtomicU64>,
 }
 
 impl FastExecutor {
@@ -113,7 +118,54 @@ impl FastExecutor {
             chain_id: config.chain_id,
             signature_type: config.signature_type,
             clob_base_url: config.clob_base_url.trim_end_matches('/').to_string(),
+            balance_usdc: Arc::new(AtomicU64::new(u64::MAX)), // MAX = "not yet fetched"
         })
+    }
+
+    /// Fetch and cache the USDC collateral balance from the CLOB.
+    /// Safe to call from a background task concurrently with `execute()`.
+    pub async fn refresh_balance(&self) {
+        let path = "/balance-allowance?asset_type=0";
+        let url = format!("{}{}", self.clob_base_url, path);
+        let ts = now_unix_secs();
+        let sig = match self.compute_hmac(&ts, "GET", path, "") {
+            Ok(s) => s,
+            Err(e) => {
+                error!("refresh_balance: hmac failed: {}", e);
+                return;
+            }
+        };
+        let resp = self
+            .http
+            .get(&url)
+            .header("POLY_ADDRESS", format!("{}", self.signer_address))
+            .header("POLY_SIGNATURE", &sig)
+            .header("POLY_TIMESTAMP", &ts)
+            .header("POLY_API_KEY", &self.api_key)
+            .header("POLY_PASSPHRASE", &self.api_passphrase)
+            .send()
+            .await;
+        match resp {
+            Err(e) => error!("refresh_balance: request failed: {}", e),
+            Ok(r) => {
+                if let Ok(body) = r.json::<serde_json::Value>().await {
+                    // CLOB returns balance in micro-USDC (1e6 = $1)
+                    let raw = body
+                        .get("balance")
+                        .and_then(|v| {
+                            v.as_u64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                        })
+                        .unwrap_or(0);
+                    self.balance_usdc.store(raw, Ordering::Relaxed);
+                    info!(
+                        "balance refreshed: ${:.4} (raw={})",
+                        raw as f64 / 1_000_000.0,
+                        raw
+                    );
+                }
+            }
+        }
     }
 
     // =====================================================================
@@ -176,6 +228,42 @@ impl FastExecutor {
         let detect_edge_pct = opp.net_edge_percent;
         let exec_edge_pct = estimate_net_edge_percent(yes_price, no_price, yes_fee_bps, no_fee_bps);
         let edge_decay_bps = ((detect_edge_pct - exec_edge_pct) * 100.0).max(0.0);
+
+        // -----------------------------------------------------------------
+        // Balance guard — free atomic read, zero network cost on hot path.
+        // sum_target_usd = shares * (yes_price + no_price) in micro-USDC.
+        // We skip only when the cached balance is known and insufficient.
+        // (u64::MAX means "not yet fetched" — let it through.)
+        // -----------------------------------------------------------------
+        let sum_target_usdc = (shares as f64 * (yes_price + no_price) * 1_000_000.0) as u64;
+        let cached_bal = self.balance_usdc.load(Ordering::Relaxed);
+        if cached_bal != u64::MAX && cached_bal < sum_target_usdc {
+            let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+            return RustExecutionResult {
+                status: "SKIPPED".into(),
+                run_id,
+                market_id: opp.market_id.clone(),
+                yes_order_id: None,
+                no_order_id: None,
+                reason: format!(
+                    "INSUFFICIENT_BALANCE cached=${:.4} needed=${:.4}",
+                    cached_bal as f64 / 1_000_000.0,
+                    sum_target_usdc as f64 / 1_000_000.0,
+                ),
+                reason_code: Some("INSUFFICIENT_BALANCE".into()),
+                yes_filled_size: 0.0,
+                no_filled_size: 0.0,
+                yes_target_price: yes_price,
+                no_target_price: no_price,
+                yes_final_price: 0.0,
+                no_final_price: 0.0,
+                sign_ms: 0.0,
+                submit_ms: 0.0,
+                detect_to_sign_ms,
+                detect_to_submit_ms: detect_to_sign_ms,
+                total_ms,
+            };
+        }
 
         if exec_edge_pct < config.min_execution_edge_percent
             || edge_decay_bps > config.max_edge_decay_bps
@@ -517,7 +605,7 @@ impl FastExecutor {
                     yes_neg_risk,
                     yes_fee_bps,
                     yes_tick,
-                    5.0,
+                    config.unwind_max_loss_pct,
                 )
                 .await;
             let rc = if unwind_ok {
@@ -603,7 +691,7 @@ impl FastExecutor {
                     no_neg_risk,
                     no_fee_bps,
                     no_tick,
-                    5.0,
+                    config.unwind_max_loss_pct,
                 )
                 .await;
             let rc = if unwind_ok {
@@ -717,7 +805,16 @@ impl FastExecutor {
         false
     }
 
-    /// Sell shares to unwind a one-sided position. Uses FAK at loss-capped price.
+    /// Sell shares to unwind a one-sided position using FAK.
+    ///
+    /// Two-attempt strategy:
+    ///   Attempt 1 — floor = buy_price × (1 − max_loss_pct/100), poll 600 ms.
+    ///               Fills at the best available bid as long as it's above floor.
+    ///   Attempt 2 — floor = $0.02 ("nuke price"), poll 600 ms.
+    ///               Virtually guaranteed to fill regardless of market move.
+    ///               Accepts large loss to guarantee position closure.
+    ///
+    /// Returns true only when a fill is confirmed (filled_size > 0 in terminal state).
     async fn unwind_sell(
         &self,
         token_id: &str,
@@ -732,10 +829,36 @@ impl FastExecutor {
             return false;
         }
 
-        // Floor price = buy_price minus max acceptable loss
-        let min_price = (buy_price * (1.0 - max_loss_pct / 100.0)).max(0.0001);
-        let sell_price = round_to_tick(min_price, tick_size);
+        // Attempt 1: sell at conservative floor (buy_price × (1 − max_loss_pct%))
+        let floor1 = (buy_price * (1.0 - max_loss_pct / 100.0)).max(0.01);
+        if self
+            .try_unwind_once(token_id, shares, floor1, neg_risk, fee_rate_bps, tick_size)
+            .await
+        {
+            return true;
+        }
 
+        // Attempt 2: nuke price — accept any fill, guaranteed exit
+        error!(
+            "unwind attempt 1 failed (floor={:.4}), retrying at nuke price (floor=0.02) token={}",
+            floor1, token_id
+        );
+        self.try_unwind_once(token_id, shares, 0.02, neg_risk, fee_rate_bps, tick_size)
+            .await
+    }
+
+    /// Submit one FAK sell and poll up to 600 ms for a confirmed fill.
+    /// Returns true only if filled_size > 0 in a terminal state.
+    async fn try_unwind_once(
+        &self,
+        token_id: &str,
+        shares: f64,
+        floor_price: f64,
+        neg_risk: bool,
+        fee_rate_bps: u32,
+        tick_size: &str,
+    ) -> bool {
+        let sell_price = round_to_tick(floor_price, tick_size);
         let order = self.build_order(token_id, sell_price, shares, fee_rate_bps, SELL);
         let sig = match self.sign_order(&order, neg_risk) {
             Ok(s) => s,
@@ -745,16 +868,55 @@ impl FastExecutor {
             }
         };
         let body = self.build_post_body(&order, &sig, "FAK");
-        match self.post_order(&body).await {
+        let oid = match self.post_order(&body).await {
             Ok(v) => {
-                info!("unwind sell submitted: oid={:?}", extract_order_id(&v));
-                true
+                let id = extract_order_id(&v);
+                info!(
+                    "unwind sell submitted: oid={:?} floor={:.4} shares={:.4}",
+                    id, floor_price, shares
+                );
+                match id {
+                    Some(s) => s,
+                    None => {
+                        error!("unwind sell: no orderID in response");
+                        return false;
+                    }
+                }
             }
             Err(e) => {
                 error!("unwind sell POST failed: {}", e);
-                false
+                return false;
             }
+        };
+
+        // Poll up to 600 ms to confirm the FAK actually filled.
+        let deadline = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < deadline {
+            if let Some((state, filled, _price)) = self.get_order_status(&oid).await {
+                if is_done(&state) {
+                    if filled > 0.0 {
+                        info!(
+                            "unwind sell confirmed: filled={:.4} state={}",
+                            filled, state
+                        );
+                        return true;
+                    } else {
+                        // FAK reached terminal state with no fill (no matching bids at floor).
+                        error!(
+                            "unwind sell: FAK terminal with 0 fill state={} floor={:.4}",
+                            state, floor_price
+                        );
+                        return false;
+                    }
+                }
+            }
+            sleep(Duration::from_millis(25)).await;
         }
+
+        // Timeout without terminal state — treat as failure (cancel defensively).
+        let _ = self.cancel_orders(&[&oid]).await;
+        error!("unwind sell: poll timeout, order cancelled oid={}", oid);
+        false
     }
 
     // =====================================================================
