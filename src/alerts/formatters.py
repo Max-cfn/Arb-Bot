@@ -285,7 +285,7 @@ def format_execution_embed(
     if s_upper in ("SUBMITTED", "PLACED", "SENDING"):
         color = EMBED_COLORS["execution_sub"]
         title_prefix = "FOK Submitted"
-        content_ping = ""
+        content_ping = "@here "      # ping as soon as both order IDs are ACK'd by the exchange
     elif s_upper in ("FILLED", "SUCCESS", "COMPLETED"):
         color = EMBED_COLORS["execution_fill"]
         title_prefix = "FILLED"
