@@ -475,33 +475,30 @@ class PolymarketClobExecutor:
                     return False, {"reason": "shares<=0"}
 
                 if emergency:
-                    # Hit ANY bid immediately — we must exit the position now.
-                    # Best-effort: try to fetch best bid for a slightly better price,
-                    # but fall back to 0.0001 if that fails (never block the hot path).
-                    sell_price = 0.0001
-                    try:
-                        ob = await asyncio.to_thread(lambda: client.get_order_book(str(token_id)))
-                        if isinstance(ob, dict):
-                            bids = ob.get("bids") or []
-                            if bids and isinstance(bids, list) and isinstance(bids[0], dict):
-                                best_bid = float(bids[0].get("price") or 0.0)
-                                if best_bid > 0:
-                                    sell_price = best_bid
-                    except Exception:
-                        pass
-
+                    # FOK one-sided fill: we must exit the position immediately.
+                    #
+                    # In Polymarket, a SELL limit order means "fill at any price >= this".
+                    # Setting price=0.0001 on a FAK SELL is equivalent to a MARKET SELL:
+                    # the order fills at whatever the best bid is (e.g. 0.43 if we bought
+                    # at 0.45). We will NOT be filled at 0.0001 — that is just the floor.
+                    # If there are zero bids the FAK cancels, but binary markets always
+                    # have bids close to fair value.
+                    #
+                    # We do NOT fetch the orderbook here: that HTTP round-trip costs
+                    # ~100 ms and serves no purpose since we accept whatever bid is there.
+                    sell_price = 0.0001  # floor = market sell
                     try:
                         sell_args = OrderArgs(token_id=str(token_id), price=float(sell_price), size=float(shares), side=SELL)
                         signed = await asyncio.to_thread(lambda: client.create_order(sell_args))
                         resp = await asyncio.to_thread(lambda: client.post_order(signed, OrderType.FAK))
                         logger.warning(
-                            "EXEC_EMERGENCY_UNWIND run=%s token=%s shares=%.4f sell_price=%.4f",
+                            "EXEC_EMERGENCY_UNWIND run=%s token=%s shares=%.4f price_floor=%.4f (market sell)",
                             run_id, token_id, float(shares), float(sell_price),
                         )
                         return True, {
                             "token": token_id,
                             "shares": float(shares),
-                            "sell_price": float(sell_price),
+                            "sell_price_floor": float(sell_price),
                             "emergency": True,
                             "resp": str(resp)[:500],
                         }

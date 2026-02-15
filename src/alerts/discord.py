@@ -19,9 +19,12 @@ from src.config import Config
 from src.detector.base import ArbitrageOpportunity
 from src.utils.logger import logger
 
-# Rate-limit: Discord allows ~30 requests/min per webhook (~2s between sends is safe).
-# Priority messages (FILLED, SUBMITTED, CANCELLED, etc.) bypass this local pacing.
-RATE_LIMIT_DELAY = 2.0  # seconds between sends for non-priority messages
+# Discord allows ~30 req/min per webhook = 2s between sends for sustained traffic.
+# Priority messages (FILLED, SUBMITTED, CANCELLED, …) skip this pacing, but we still
+# enforce a 1s minimum gap to avoid back-to-back 429s when SUBMITTED+FILLED arrive
+# within milliseconds of each other.
+RATE_LIMIT_DELAY = 2.0          # seconds between sends — non-priority messages
+PRIORITY_MIN_GAP  = 1.0         # minimum seconds between sends — priority messages
 
 
 class DiscordClient:
@@ -36,50 +39,78 @@ class DiscordClient:
             "executions": config.discord_webhook_executions,  # errors
             "executions_info": config.discord_webhook_executions_info,
         }
-        self._last_send: float = 0
         self._last_send_by_webhook: dict[str, float] = {}
+        # Per-webhook lock: serializes concurrent sends to the same webhook so we
+        # never fire two requests simultaneously and trigger Discord rate-limiting.
+        self._locks: dict[str, asyncio.Lock] = {}
 
-    async def _send(self, webhook_key: str, payload: dict[str, Any], *, priority: bool = False) -> bool:
-        """Send a payload to the specified webhook."""
+    def _lock(self, webhook_key: str) -> asyncio.Lock:
+        if webhook_key not in self._locks:
+            self._locks[webhook_key] = asyncio.Lock()
+        return self._locks[webhook_key]
+
+    async def _send(
+        self,
+        webhook_key: str,
+        payload: dict[str, Any],
+        *,
+        priority: bool = False,
+        _retry: bool = False,
+    ) -> bool:
+        """Send a payload to the specified webhook.
+
+        - Non-priority: waits for RATE_LIMIT_DELAY since last send on this webhook.
+        - Priority: waits for PRIORITY_MIN_GAP (1 s) to avoid back-to-back 429s.
+        - Per-webhook asyncio.Lock: only one request in-flight at a time per webhook.
+        - 429 handling: respects retry_after from Discord, then retries with same
+          priority flag (so no accidental 2 s re-pacing on a critical message).
+        """
         url = self._webhooks.get(webhook_key, "")
         if not url:
             logger.debug("No webhook configured for %s, skipping", webhook_key)
             return False
 
-        try:
-            # Basic rate-limit guard (per-webhook).
-            # `priority=True` lets critical events (e.g. SUBMITTED) skip local pacing.
-            if not priority:
+        async with self._lock(webhook_key):
+            try:
                 now = asyncio.get_event_loop().time()
                 last = self._last_send_by_webhook.get(webhook_key, 0.0)
                 elapsed = now - last
-                if elapsed < RATE_LIMIT_DELAY:
-                    await asyncio.sleep(RATE_LIMIT_DELAY - elapsed)
+                min_gap = PRIORITY_MIN_GAP if priority else RATE_LIMIT_DELAY
+                if elapsed < min_gap:
+                    await asyncio.sleep(min_gap - elapsed)
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    sent_ts = asyncio.get_event_loop().time()
-                    self._last_send = sent_ts
-                    self._last_send_by_webhook[webhook_key] = sent_ts
-                    if resp.status == 204:
-                        return True
-                    if resp.status == 429:
-                        retry_after = (await resp.json()).get("retry_after", 5)
-                        logger.warning("Discord rate limited, retry after %.1fs", retry_after)
-                        await asyncio.sleep(retry_after)
-                        return await self._send(webhook_key, payload)
-                    logger.warning(
-                        "Discord webhook %s returned %d", webhook_key, resp.status
-                    )
-                    return False
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        url,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        self._last_send_by_webhook[webhook_key] = asyncio.get_event_loop().time()
+                        if resp.status == 204:
+                            return True
+                        if resp.status == 429:
+                            body = await resp.json(content_type=None)
+                            retry_after = float(body.get("retry_after", 5))
+                            logger.warning(
+                                "Discord 429 on %s, retry after %.1fs (priority=%s)",
+                                webhook_key, retry_after, priority,
+                            )
+                            await asyncio.sleep(retry_after)
+                            # Release lock before recursing so the retry can re-acquire it.
+                        else:
+                            logger.warning(
+                                "Discord webhook %s returned %d", webhook_key, resp.status
+                            )
+                            return False
 
-        except Exception as exc:
-            logger.error("Failed to send Discord %s: %s", webhook_key, exc)
-            return False
+            except Exception as exc:
+                logger.error("Failed to send Discord %s: %s", webhook_key, exc)
+                return False
+
+        # Retry outside the lock (it will re-acquire on entry).
+        if resp.status == 429:  # type: ignore[possibly-undefined]
+            return await self._send(webhook_key, payload, priority=priority, _retry=True)
+        return False
 
     async def send_opportunity(self, opp: ArbitrageOpportunity) -> bool:
         """Send an arbitrage opportunity alert."""
@@ -111,15 +142,16 @@ class DiscordClient:
     ) -> bool:
         """Send execution status to the appropriate Discord channel.
 
-        Priority (no rate-limit delay) for:
-        - SUBMITTED / PLACED / SENDING — order just sent, time-sensitive
+        Priority (PRIORITY_MIN_GAP = 1 s) for all financially significant events:
+        - SUBMITTED / PLACED / SENDING — order just sent
         - FILLED / SUCCESS / COMPLETED — trade confirmed, must never be lost
-        - CANCELLED / FAILED           — also priority so unwind events surface fast
+        - CANCELLED / FAILED / ERROR   — unwind events must surface fast
+
+        Fallback chain: executions_info → executions → ops.
         """
         payload = format_execution_embed(opp, note=note, run_id=run_id, status=status)
         normalized = str(status).upper().strip()
 
-        # All execution events that have financial consequence are priority.
         is_priority = normalized in {
             "SUBMITTED", "PLACED", "SENDING",
             "FILLED", "SUCCESS", "COMPLETED",
@@ -129,7 +161,6 @@ class DiscordClient:
         error_statuses = {"FAILED", "CANCELLED", "REJECTED", "ERROR"}
         target = "executions" if normalized in error_statuses else "executions_info"
 
-        # Backward-compatible fallback chain: try primary channel, then executions, then ops.
         ok = await self._send(target, payload, priority=is_priority)
         if not ok and target == "executions_info":
             ok = await self._send("executions", payload, priority=is_priority)
