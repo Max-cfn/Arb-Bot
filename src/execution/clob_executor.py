@@ -22,6 +22,24 @@ def _safe_float(x, default: float = 0.0) -> float:
         return float(default)
 
 
+def _tick_price(p: float) -> float:
+    """Round price to Polymarket tick size (0.001).
+
+    Prices outside [0.001, 0.999] are rejected by the CLOB with HTTP 400.
+    """
+    p = round(float(p), 4)          # avoid float noise before rounding
+    p = round(round(p * 1000) / 1000, 6)
+    return float(min(0.999, max(0.001, p)))
+
+
+def _tick_size(s: float) -> float:
+    """Round size down to the nearest integer.
+
+    Polymarket CLOB requires integer share quantities; non-integer sizes return 400.
+    """
+    return float(int(float(s)))
+
+
 def _redact(s: str, keep: int = 6) -> str:
     if not s:
         return ""
@@ -250,32 +268,47 @@ class PolymarketClobExecutor:
 
         client = self._get_client()
 
-        # Best-effort: fetch balance/allowance snapshot for debugging.
-        # In py-clob-client==0.34.5 BalanceAllowanceParams does NOT accept funder; funder is inferred from API creds.
-        bal_info = None
-        try:
-            from py_clob_client.clob_types import AssetType
+        # Balance/allowance snapshot — fired asynchronously (does NOT block the hot path).
+        # The result is captured for the start-log only; we do not gate execution on it.
+        bal_info_holder: list = [None]
 
-            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=int(self.signature_type))
-            # Some setups require an explicit refresh
+        async def _fetch_balance() -> None:
             try:
-                await asyncio.to_thread(lambda: client.update_balance_allowance(params))
-            except Exception:
-                pass
-            bal_info = await asyncio.to_thread(lambda: client.get_balance_allowance(params))
-        except Exception as exc:
-            bal_info = {"error": str(exc)[:200]}
+                from py_clob_client.clob_types import AssetType
+                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=int(self.signature_type))
+                try:
+                    await asyncio.to_thread(lambda: client.update_balance_allowance(params))
+                except Exception:
+                    pass
+                bal_info_holder[0] = await asyncio.to_thread(lambda: client.get_balance_allowance(params))
+            except Exception as exc:
+                bal_info_holder[0] = {"error": str(exc)[:200]}
+
+        # Start balance fetch in background; we proceed with order prep immediately.
+        _bal_task = asyncio.create_task(_fetch_balance(), name=f"bal-{run_id}")
 
         # Aggressive limit prices: cross a few bps above best ask to improve fill probability.
+        # Apply tick rounding AFTER the bump — avoids HTTP 400 "invalid price precision".
         def _aggressive_buy_limit(p: float) -> float:
             p = float(p)
             if p <= 0:
                 return p
             bumped = p * (1.0 + (self.cross_bps / 10_000.0))
-            return float(min(0.9999, max(0.0001, bumped)))
+            return _tick_price(bumped)
 
         yes_limit = _aggressive_buy_limit(yes_price)
         no_limit = _aggressive_buy_limit(no_price)
+        # Sizes must be integers — CLOB returns 400 for fractional shares.
+        yes_size = _tick_size(yes_size)
+        no_size = _tick_size(no_size)
+
+        if yes_size <= 0 or no_size <= 0:
+            return ExecutionResult(
+                status="FAILED",
+                run_id=run_id,
+                reason=f"Size rounded to 0 (shares={shares}); cannot submit zero-size order.",
+                metrics=metrics,
+            )
 
         yes_args = OrderArgs(token_id=str(opp.yes_token_id), price=yes_limit, size=yes_size, side=BUY)
         no_args = OrderArgs(token_id=str(opp.no_token_id), price=no_limit, size=no_size, side=BUY)
@@ -284,7 +317,8 @@ class PolymarketClobExecutor:
         est_total_cost = float(yes_limit * yes_size + no_limit * no_size)
         max_loss_usd = max(self.unwind_min_loss_usd, est_total_cost * 0.05)
 
-        # Initial execution context log (helps reproduce trades)
+        # Initial execution context log — balance may still be fetching; log whatever we have.
+        bal_info = bal_info_holder[0]  # None if still in-flight (that's fine)
         self._log_exec(
             "start",
             run_id=run_id,
@@ -354,8 +388,8 @@ class PolymarketClobExecutor:
             t_sign_ns = time.monotonic_ns()
 
             resp_yes, resp_no = await asyncio.gather(
-                asyncio.to_thread(lambda: client.post_order(signed_yes, OrderType.GTC)),
-                asyncio.to_thread(lambda: client.post_order(signed_no, OrderType.GTC)),
+                asyncio.to_thread(lambda: client.post_order(signed_yes, OrderType.FOK)),
+                asyncio.to_thread(lambda: client.post_order(signed_no, OrderType.FOK)),
             )
             metrics.t_ack_ns = time.monotonic_ns()
 
@@ -405,6 +439,31 @@ class PolymarketClobExecutor:
                 detect_to_sign_ms=(round(detect_to_sign_ms, 3) if detect_to_sign_ms is not None else None),
             )
 
+            # ── PARTIAL SUBMIT GUARD ──────────────────────────────────────────────────
+            # If one submit returned no orderID (400/auth error on that leg), the other
+            # leg may already be live on the exchange.  Cancel it immediately and abort.
+            if yes_oid is None or no_oid is None:
+                abort_reason = (
+                    f"Partial submit: yes_oid={'ok' if yes_oid else 'NONE'} "
+                    f"no_oid={'ok' if no_oid else 'NONE'}. "
+                    f"resp_yes={str(resp_yes)[:200]} resp_no={str(resp_no)[:200]}"
+                )
+                logger.error("EXEC_PARTIAL_SUBMIT run=%s %s", run_id, abort_reason)
+                # Best-effort cancel of whichever leg DID get an ID
+                for _oid in filter(None, [yes_oid, no_oid]):
+                    try:
+                        await asyncio.to_thread(lambda: client.cancel_order(str(_oid)))
+                    except Exception as _ce:
+                        logger.error("EXEC_PARTIAL_SUBMIT cancel run=%s oid=%s err=%s", run_id, _oid, _ce)
+                self._note_outcome("FAILED")
+                return ExecutionResult(
+                    status="FAILED",
+                    run_id=run_id,
+                    reason=abort_reason,
+                    reason_code="PARTIAL_SUBMIT",
+                    metrics=metrics,
+                )
+
             # --- Complete-or-Abort execution policy ---
             # Phase 2: WAIT FOR BOTH (up to WAIT_FOR_BOTH_MS)
             async def _get_status(order_id: str | None) -> tuple[str, dict] | None:
@@ -449,70 +508,125 @@ class PolymarketClobExecutor:
 
             async def _buy_other_leg(token_id: str, shares: float, ref_price: float) -> str | None:
                 p = float(ref_price) * (1.0 + self.retry_slippage_percent / 100.0)
-                p = float(min(0.9999, max(0.0001, p)))
-                args = OrderArgs(token_id=str(token_id), price=p, size=float(shares), side=BUY)
+                p = _tick_price(p)
+                sz = _tick_size(shares)
+                if sz <= 0:
+                    return None
+                args = OrderArgs(token_id=str(token_id), price=p, size=sz, side=BUY)
                 signed = await asyncio.to_thread(lambda: client.create_order(args))
                 resp = await asyncio.to_thread(lambda: client.post_order(signed, OrderType.FAK))
                 oid = (resp or {}).get("orderID") or (resp or {}).get("id")
                 return str(oid) if oid else None
 
-            async def _unwind_sell(token_id: str, shares: float, buy_price: float) -> tuple[bool, dict]:
-                """Attempt to unwind by SELLing filled shares with bounded loss.
+            async def _unwind_sell(
+                token_id: str,
+                shares: float,
+                buy_price: float,
+                *,
+                emergency: bool = False,
+            ) -> tuple[bool, dict]:
+                """Attempt to unwind by SELLing filled shares.
+
+                emergency=True  → FOK one-sided fill: sell at any price (0.0001 floor),
+                                  take the hit, get out immediately.
+                emergency=False → bounded loss unwind (normal recovery path).
 
                 Returns (ok, info).
                 """
                 if shares <= 0:
                     return False, {"reason": "shares<=0"}
 
-                # Percent bound
-                min_price_pct = float(buy_price) * (1.0 - self.unwind_max_loss_percent / 100.0)
-                # USD bound
-                min_price_usd = float(buy_price) - (max_loss_usd / float(shares))
-                min_sell_price = max(0.0001, min_price_pct, min_price_usd)
+                if emergency:
+                    # FOK one-sided fill: we must exit the position immediately.
+                    #
+                    # In Polymarket, a SELL limit order means "fill at any price >= this".
+                    # Setting price=0.0001 on a FAK SELL is equivalent to a MARKET SELL:
+                    # the order fills at whatever the best bid is (e.g. 0.43 if we bought
+                    # at 0.45). We will NOT be filled at 0.0001 — that is just the floor.
+                    # If there are zero bids the FAK cancels, but binary markets always
+                    # have bids close to fair value.
+                    #
+                    # We do NOT fetch the orderbook here: that HTTP round-trip costs
+                    # ~100 ms and serves no purpose since we accept whatever bid is there.
+                    sell_price = 0.001  # Polymarket tick floor — FAK SELL fills at best bid
+                    sz = _tick_size(shares)
+                    if sz <= 0:
+                        return False, {"reason": "emergency unwind: rounded size=0"}
+                    try:
+                        sell_args = OrderArgs(token_id=str(token_id), price=float(sell_price), size=sz, side=SELL)
+                        signed = await asyncio.to_thread(lambda: client.create_order(sell_args))
+                        resp = await asyncio.to_thread(lambda: client.post_order(signed, OrderType.FAK))
+                        logger.warning(
+                            "EXEC_EMERGENCY_UNWIND run=%s token=%s shares=%.4f price_floor=%.4f (market sell)",
+                            run_id, token_id, float(shares), float(sell_price),
+                        )
+                        return True, {
+                            "token": token_id,
+                            "shares": float(shares),
+                            "sell_price_floor": float(sell_price),
+                            "emergency": True,
+                            "resp": str(resp)[:500],
+                        }
+                    except Exception as exc:
+                        logger.error("EXEC_EMERGENCY_UNWIND_FAILED run=%s err=%s", run_id, exc)
+                        return False, {"token": token_id, "shares": float(shares), "err": str(exc)[:200], "emergency": True}
+                else:
+                    # Percent bound
+                    min_price_pct = float(buy_price) * (1.0 - self.unwind_max_loss_percent / 100.0)
+                    # USD bound
+                    min_price_usd = float(buy_price) - (max_loss_usd / float(shares))
+                    min_sell_price = _tick_price(max(0.001, min_price_pct, min_price_usd))
 
-                # Use best bid as a reference if available
-                best_bid = None
-                try:
-                    ob = await asyncio.to_thread(lambda: client.get_order_book(str(token_id)))
-                    if isinstance(ob, dict):
-                        bids = ob.get("bids") or []
-                        if bids and isinstance(bids, list) and isinstance(bids[0], dict):
-                            best_bid = float(bids[0].get("price") or 0.0)
-                except Exception:
+                    # Use best bid as a reference if available
                     best_bid = None
+                    try:
+                        ob = await asyncio.to_thread(lambda: client.get_order_book(str(token_id)))
+                        if isinstance(ob, dict):
+                            bids = ob.get("bids") or []
+                            if bids and isinstance(bids, list) and isinstance(bids[0], dict):
+                                best_bid = float(bids[0].get("price") or 0.0)
+                    except Exception:
+                        best_bid = None
 
-                # For SELL: lower price is more aggressive, but never below bounds.
-                sell_price = min_sell_price
-                if best_bid and best_bid > 0:
-                    sell_price = max(min_sell_price, min(best_bid, buy_price))
+                    # For SELL: lower price is more aggressive, but never below bounds.
+                    sell_price = min_sell_price
+                    if best_bid and best_bid > 0:
+                        sell_price = max(min_sell_price, min(best_bid, buy_price))
+                    sell_price = _tick_price(sell_price)
+                    sz = _tick_size(shares)
+                    if sz <= 0:
+                        return False, {"reason": "bounded unwind: rounded size=0"}
+                    try:
+                        sell_args = OrderArgs(token_id=str(token_id), price=float(sell_price), size=sz, side=SELL)
+                        signed = await asyncio.to_thread(lambda: client.create_order(sell_args))
+                        resp = await asyncio.to_thread(lambda: client.post_order(signed, OrderType.FAK))
 
-                try:
-                    sell_args = OrderArgs(token_id=str(token_id), price=float(sell_price), size=float(shares), side=SELL)
-                    signed = await asyncio.to_thread(lambda: client.create_order(sell_args))
-                    resp = await asyncio.to_thread(lambda: client.post_order(signed, OrderType.FAK))
+                        logger.warning(
+                            "EXEC_UNWIND run=%s token=%s shares=%.4f sell_price=%.4f min_sell_price=%.4f max_loss_usd=%.2f",
+                            run_id,
+                            token_id,
+                            float(shares),
+                            float(sell_price),
+                            float(min_sell_price),
+                            float(max_loss_usd),
+                        )
+                        return True, {
+                            "token": token_id,
+                            "shares": float(shares),
+                            "sell_price": float(sell_price),
+                            "min_sell_price": float(min_sell_price),
+                            "max_loss_usd": float(max_loss_usd),
+                            "resp": str(resp)[:500],
+                        }
+                    except Exception as exc:
+                        logger.error("EXEC_UNWIND_FAILED run=%s err=%s", run_id, exc)
+                        return False, {"token": token_id, "shares": float(shares), "err": str(exc)[:200]}
 
-                    logger.warning(
-                        "EXEC_UNWIND run=%s token=%s shares=%.4f sell_price=%.4f min_sell_price=%.4f max_loss_usd=%.2f",
-                        run_id,
-                        token_id,
-                        float(shares),
-                        float(sell_price),
-                        float(min_sell_price),
-                        float(max_loss_usd),
-                    )
-                    return True, {
-                        "token": token_id,
-                        "shares": float(shares),
-                        "sell_price": float(sell_price),
-                        "min_sell_price": float(min_sell_price),
-                        "max_loss_usd": float(max_loss_usd),
-                        "resp": str(resp)[:500],
-                    }
-                except Exception as exc:
-                    logger.error("EXEC_UNWIND_FAILED run=%s err=%s", run_id, exc)
-                    return False, {"token": token_id, "shares": float(shares), "err": str(exc)[:200]}
+            # Phase 2: FOK orders resolve instantly (filled or auto-cancelled by exchange).
+            # Wait one poll interval for the server to process, then read final statuses.
+            # If both filled in first check → done. Otherwise go straight to recovery.
+            await asyncio.sleep(self.poll_interval_s)
 
-            wait_deadline = time.monotonic() + self.wait_for_both_s
             last_yes: dict = {}
             last_no: dict = {}
             yes_filled = False
@@ -520,6 +634,8 @@ class PolymarketClobExecutor:
             yes_size_filled = 0.0
             no_size_filled = 0.0
 
+            # Up to wait_for_both_s in case server-side status propagation is slow.
+            wait_deadline = time.monotonic() + self.wait_for_both_s
             while time.monotonic() < wait_deadline:
                 ys = await _get_status(str(yes_oid) if yes_oid else None)
                 ns = await _get_status(str(no_oid) if no_oid else None)
@@ -544,7 +660,7 @@ class PolymarketClobExecutor:
                         yes_order_id=str(yes_oid) if yes_oid else None,
                         no_order_id=str(no_oid) if no_oid else None,
                         reason=(
-                            f"Complete within {self.wait_for_both_s*1000:.0f}ms. "
+                            f"FOK complete. "
                             f"submit→ack={(metrics.t_ack_ns-metrics.t_submit_ns)/1e6:.3f}ms submit→filled={(metrics.t_both_filled_ns-metrics.t_submit_ns)/1e6:.3f}ms"
                         ),
                         reason_code="BOTH_FILLED",
@@ -557,29 +673,73 @@ class PolymarketClobExecutor:
                         run_id=run_id,
                         status=res.status,
                         reason=res.reason[:800],
-                        phase="wait_for_both",
+                        phase="fok_both_filled",
                         yes_size_filled=round(float(yes_size_filled), 6),
                         no_size_filled=round(float(no_size_filled), 6),
                     )
                     self._note_outcome(res.status)
                     return res
 
+                # FOK should resolve nearly immediately; stop polling early if both are terminal
+                ys_done = ys is not None and _is_done(ys[0])
+                ns_done = ns is not None and _is_done(ns[0])
+                if ys_done and ns_done:
+                    break  # Both terminal, no point continuing
+
                 await asyncio.sleep(self.poll_interval_s)
 
             # Phase 3: RECOVERY
+            # ── TERMINAL-STATE GUARANTEE ─────────────────────────────────────────────
+            # Before making any recovery decision we need BOTH orders to be in a
+            # provably terminal state (FILLED / CANCELLED / REJECTED / …).
+            # FOK should auto-cancel immediately, but API status can lag.
+            # Strategy:
+            #   1. Cancel any orders still showing OPEN (safety net).
+            #   2. Poll until both statuses are terminal (max 300 ms extra).
+            #      If still uncertain after timeout, treat unknown = CANCELLED.
             to_cancel = await _cancel_open()
-            await asyncio.sleep(0.05)
 
-            ys2 = await _get_status(str(yes_oid) if yes_oid else None)
-            ns2 = await _get_status(str(no_oid) if no_oid else None)
-            if ys2 is not None:
-                yst2, last_yes = ys2
-                yes_size_filled = max(yes_size_filled, _filled_size(last_yes))
-                yes_filled = yes_filled or (yst2 == "FILLED")
-            if ns2 is not None:
-                nst2, last_no = ns2
-                no_size_filled = max(no_size_filled, _filled_size(last_no))
-                no_filled = no_filled or (nst2 == "FILLED")
+            terminal_deadline = time.monotonic() + 0.3  # 300 ms hard cap
+            yes_terminal = yes_filled  # already confirmed above if True
+            no_terminal = no_filled
+            while time.monotonic() < terminal_deadline and not (yes_terminal and no_terminal):
+                yt, nt = await asyncio.gather(
+                    _get_status(str(yes_oid)),
+                    _get_status(str(no_oid)),
+                )
+                if yt is not None:
+                    yst2, last_yes = yt
+                    yes_size_filled = max(yes_size_filled, _filled_size(last_yes))
+                    yes_filled = yes_filled or (yst2 == "FILLED")
+                    yes_terminal = _is_done(yst2)
+                else:
+                    yes_terminal = True  # treat unreachable as terminal (conservative)
+                if nt is not None:
+                    nst2, last_no = nt
+                    no_size_filled = max(no_size_filled, _filled_size(last_no))
+                    no_filled = no_filled or (nst2 == "FILLED")
+                    no_terminal = _is_done(nst2)
+                else:
+                    no_terminal = True
+
+                if yes_terminal and no_terminal:
+                    break
+                await asyncio.sleep(0.025)
+
+            # Log final confirmed state of both orders
+            self._log_exec(
+                "terminal_state",
+                run_id=run_id,
+                yes_oid=_redact(str(yes_oid)),
+                no_oid=_redact(str(no_oid)),
+                yes_filled=yes_filled,
+                no_filled=no_filled,
+                yes_size_filled=round(float(yes_size_filled), 6),
+                no_size_filled=round(float(no_size_filled), 6),
+                yes_terminal=yes_terminal,
+                no_terminal=no_terminal,
+                cancelled_open=len(to_cancel),
+            )
 
             # Case A: both legs filled >0 (hedged, possibly smaller)
             if yes_size_filled > 0 and no_size_filled > 0:
@@ -617,11 +777,14 @@ class PolymarketClobExecutor:
                 self._note_outcome(res.status)
                 return res
 
-            # Case B: one-sided fill -> RETRY other leg (200ms) else unwind
+            # Case B: one-sided fill (FOK — other leg was auto-cancelled by exchange)
+            # → immediately try to buy the other leg one more time with FAK + slippage.
+            # → if that also fails, emergency-unwind (sell at ANY price) the filled leg NOW.
             if (yes_size_filled > 0) != (no_size_filled > 0):
                 metrics.t_first_fill_ns = time.monotonic_ns()
 
                 if yes_size_filled > 0:
+                    # YES filled, NO auto-cancelled — attempt one fast FAK retry for NO
                     retry_oid = await _buy_other_leg(str(opp.no_token_id), yes_size_filled, float(opp.no_best_ask or no_price))
                     retry_deadline = time.monotonic() + self.retry_duration_s
                     no_retry_filled = False
@@ -639,7 +802,7 @@ class PolymarketClobExecutor:
                             run_id=run_id,
                             yes_order_id=str(yes_oid) if yes_oid else None,
                             no_order_id=str(retry_oid) if retry_oid else (str(no_oid) if no_oid else None),
-                            reason=f"Retry succeeded within {self.retry_duration_s*1000:.0f}ms (+{self.retry_slippage_percent:.1f}% slippage).",
+                            reason=f"FOK YES filled + FAK retry NO succeeded within {self.retry_duration_s*1000:.0f}ms (+{self.retry_slippage_percent:.1f}% slippage).",
                             reason_code="PARTIAL_RETRY_SUCCESS",
                             yes_filled_size=float(yes_size_filled),
                             no_filled_size=float(yes_size_filled),
@@ -650,7 +813,7 @@ class PolymarketClobExecutor:
                             run_id=run_id,
                             status=res.status,
                             reason=res.reason[:800],
-                            phase="retry_other_leg_success",
+                            phase="fok_yes_filled_retry_no_success",
                             retry_leg="NO",
                             retry_oid=_redact(str(retry_oid) if retry_oid else ""),
                             yes_size_filled=round(float(yes_size_filled), 6),
@@ -658,33 +821,34 @@ class PolymarketClobExecutor:
                         self._note_outcome(res.status)
                         return res
 
-                    unwind_ok, unwind_info = await _unwind_sell(str(opp.yes_token_id), yes_size_filled, yes_limit)
+                    # NO retry failed → EMERGENCY market-sell YES immediately
+                    unwind_ok, unwind_info = await _unwind_sell(str(opp.yes_token_id), yes_size_filled, yes_limit, emergency=True)
                     res = ExecutionResult(
                         status="CANCELLED",
                         run_id=run_id,
                         yes_order_id=str(yes_oid) if yes_oid else None,
                         no_order_id=str(no_oid) if no_oid else None,
-                        reason=f"One-sided fill YES={yes_size_filled:.4f}; retry NO failed; unwind_ok={unwind_ok} (max_loss_usd={max_loss_usd:.2f}).",
-                        reason_code=("PARTIAL_UNWIND_OK" if unwind_ok else "PARTIAL_UNWIND_FAILED"),
+                        reason=f"FOK: YES={yes_size_filled:.4f} filled, NO auto-cancelled; FAK retry failed; EMERGENCY_UNWIND ok={unwind_ok}.",
+                        reason_code=("FOK_EMERGENCY_UNWIND_OK" if unwind_ok else "FOK_EMERGENCY_UNWIND_FAILED"),
                         yes_filled_size=float(yes_size_filled),
                         no_filled_size=0.0,
                         metrics=metrics,
                     )
-                    self._log_exec("unwind", run_id=run_id, ok=unwind_ok, info=unwind_info)
+                    self._log_exec("emergency_unwind", run_id=run_id, ok=unwind_ok, info=unwind_info)
                     self._log_exec(
                         "result",
                         run_id=run_id,
                         status=res.status,
                         reason=res.reason[:800],
-                        phase="retry_other_leg_failed_unwind",
+                        phase="fok_yes_filled_emergency_unwind",
                         filled_leg="YES",
                         filled_shares=round(float(yes_size_filled), 6),
-                        max_loss_usd=round(float(max_loss_usd), 4),
                     )
                     self._note_outcome(res.status)
                     return res
 
                 else:
+                    # NO filled, YES auto-cancelled — attempt one fast FAK retry for YES
                     retry_oid = await _buy_other_leg(str(opp.yes_token_id), no_size_filled, float(opp.yes_best_ask or yes_price))
                     retry_deadline = time.monotonic() + self.retry_duration_s
                     yes_retry_filled = False
@@ -702,7 +866,7 @@ class PolymarketClobExecutor:
                             run_id=run_id,
                             yes_order_id=str(retry_oid) if retry_oid else (str(yes_oid) if yes_oid else None),
                             no_order_id=str(no_oid) if no_oid else None,
-                            reason=f"Retry succeeded within {self.retry_duration_s*1000:.0f}ms (+{self.retry_slippage_percent:.1f}% slippage).",
+                            reason=f"FOK NO filled + FAK retry YES succeeded within {self.retry_duration_s*1000:.0f}ms (+{self.retry_slippage_percent:.1f}% slippage).",
                             reason_code="PARTIAL_RETRY_SUCCESS",
                             yes_filled_size=float(no_size_filled),
                             no_filled_size=float(no_size_filled),
@@ -713,7 +877,7 @@ class PolymarketClobExecutor:
                             run_id=run_id,
                             status=res.status,
                             reason=res.reason[:800],
-                            phase="retry_other_leg_success",
+                            phase="fok_no_filled_retry_yes_success",
                             retry_leg="YES",
                             retry_oid=_redact(str(retry_oid) if retry_oid else ""),
                             no_size_filled=round(float(no_size_filled), 6),
@@ -721,28 +885,28 @@ class PolymarketClobExecutor:
                         self._note_outcome(res.status)
                         return res
 
-                    unwind_ok, unwind_info = await _unwind_sell(str(opp.no_token_id), no_size_filled, no_limit)
+                    # YES retry failed → EMERGENCY market-sell NO immediately
+                    unwind_ok, unwind_info = await _unwind_sell(str(opp.no_token_id), no_size_filled, no_limit, emergency=True)
                     res = ExecutionResult(
                         status="CANCELLED",
                         run_id=run_id,
                         yes_order_id=str(yes_oid) if yes_oid else None,
                         no_order_id=str(no_oid) if no_oid else None,
-                        reason=f"One-sided fill NO={no_size_filled:.4f}; retry YES failed; unwind_ok={unwind_ok} (max_loss_usd={max_loss_usd:.2f}).",
-                        reason_code=("PARTIAL_UNWIND_OK" if unwind_ok else "PARTIAL_UNWIND_FAILED"),
+                        reason=f"FOK: NO={no_size_filled:.4f} filled, YES auto-cancelled; FAK retry failed; EMERGENCY_UNWIND ok={unwind_ok}.",
+                        reason_code=("FOK_EMERGENCY_UNWIND_OK" if unwind_ok else "FOK_EMERGENCY_UNWIND_FAILED"),
                         yes_filled_size=0.0,
                         no_filled_size=float(no_size_filled),
                         metrics=metrics,
                     )
-                    self._log_exec("unwind", run_id=run_id, ok=unwind_ok, info=unwind_info)
+                    self._log_exec("emergency_unwind", run_id=run_id, ok=unwind_ok, info=unwind_info)
                     self._log_exec(
                         "result",
                         run_id=run_id,
                         status=res.status,
                         reason=res.reason[:800],
-                        phase="retry_other_leg_failed_unwind",
+                        phase="fok_no_filled_emergency_unwind",
                         filled_leg="NO",
                         filled_shares=round(float(no_size_filled), 6),
-                        max_loss_usd=round(float(max_loss_usd), 4),
                     )
                     self._note_outcome(res.status)
                     return res
@@ -780,11 +944,35 @@ class PolymarketClobExecutor:
             cause = getattr(exc, "__cause__", None)
             context = getattr(exc, "__context__", None)
 
-            # Classify common failure modes (so we can tell "network" vs "rejected")
-            reason_code = None
-            if "Request exception" in err_s or "Request exception" in err_repr:
+            # ── Detailed error classification ─────────────────────────────────────
+            # py-clob-client wraps HTTP errors as PolyApiException with status_code.
+            # We inspect both the exception type and the message to classify.
+            http_status: int | None = getattr(exc, "status_code", None)
+            err_lower = err_s.lower()
+
+            if http_status == 400 or "status_code=400" in err_repr or "bad request" in err_lower:
+                # Invalid price precision, invalid size, or malformed payload.
+                # These should NEVER be retried — log params for debugging.
+                reason_code = "HTTP_400_BAD_REQUEST"
+                logger.error(
+                    "EXEC_HTTP_400 run=%s — likely price/size precision or token error. "
+                    "yes_limit=%s no_limit=%s yes_size=%s no_size=%s err=%s",
+                    run_id, yes_limit, no_limit, yes_size, no_size, err_s[:400],
+                )
+            elif http_status == 401 or "status_code=401" in err_repr or "unauthorized" in err_lower or "invalid signature" in err_lower:
+                # Auth / signature failure: wrong key, clock skew, bad passphrase.
+                reason_code = "HTTP_401_AUTH"
+                logger.error(
+                    "EXEC_HTTP_401 run=%s — check CLOB_API_KEY / CLOB_API_SECRET / CLOB_API_PASSPHRASE / clock skew. err=%s",
+                    run_id, err_s[:400],
+                )
+            elif http_status == 403 or "status_code=403" in err_repr or "forbidden" in err_lower:
+                reason_code = "HTTP_403_FORBIDDEN"
+            elif http_status is not None and http_status >= 500:
+                reason_code = "HTTP_5XX_SERVER"
+            elif "request exception" in err_s or "request exception" in err_repr:
                 reason_code = "REQUEST_EXCEPTION"
-            elif "not enough balance" in err_s.lower() or "allowance" in err_s.lower():
+            elif "not enough balance" in err_lower or "allowance" in err_lower:
                 reason_code = "NOT_ENOUGH_BALANCE_OR_ALLOWANCE"
             else:
                 reason_code = "EXEC_EXCEPTION"
