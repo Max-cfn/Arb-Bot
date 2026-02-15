@@ -15,7 +15,7 @@ use polymarket_engine::detector::detect_binary_arb;
 use polymarket_engine::executor::FastExecutor;
 use polymarket_engine::orderbook::OrderbookManager;
 use polymarket_engine::types::{EngineConfig, MarketInfo};
-use polymarket_engine::ws_client::{run_ws_stream, WsEvent};
+use polymarket_engine::ws_client::{WsEvent, run_ws_stream};
 
 #[derive(Debug, Deserialize)]
 struct GammaToken {
@@ -93,7 +93,9 @@ fn load_dotenv(dotenv_path: &str) {
         }
         if let Some((k, v)) = line.split_once('=') {
             if env::var_os(k).is_none() {
-                unsafe { env::set_var(k.trim(), v.trim()); }
+                unsafe {
+                    env::set_var(k.trim(), v.trim());
+                }
             }
         }
     }
@@ -101,8 +103,10 @@ fn load_dotenv(dotenv_path: &str) {
 
 fn build_config() -> EngineConfig {
     let mut cfg = EngineConfig::new();
-    cfg.clob_base_url = env::var("CLOB_BASE_URL").unwrap_or_else(|_| "https://clob.polymarket.com".into());
-    cfg.ws_url = env::var("WS_URL").unwrap_or_else(|_| "wss://ws-subscriptions-clob.polymarket.com/ws/market".into());
+    cfg.clob_base_url =
+        env::var("CLOB_BASE_URL").unwrap_or_else(|_| "https://clob.polymarket.com".into());
+    cfg.ws_url = env::var("WS_URL")
+        .unwrap_or_else(|_| "wss://ws-subscriptions-clob.polymarket.com/ws/market".into());
     cfg.private_key = env::var("CLOB_PRIVATE_KEY").unwrap_or_default();
     cfg.funder_address = env::var("CLOB_FUNDER_ADDRESS").unwrap_or_default();
     cfg.api_key = env::var("CLOB_API_KEY").unwrap_or_default();
@@ -119,10 +123,21 @@ fn build_config() -> EngineConfig {
     cfg.cross_bps = getenv_parse("CLOB_AGGRESSIVE_CROSS_BPS", 5.0f64);
     cfg.min_order_usd = getenv_parse("CLOB_MIN_ORDER_USD", 1.0f64);
     cfg.min_order_shares = getenv_parse("CLOB_MIN_ORDER_SHARES", 5.0f64);
+    cfg.min_execution_edge_percent =
+        getenv_parse("MIN_EXECUTION_EDGE_PERCENT", cfg.min_edge_percent);
+    cfg.max_edge_decay_bps = getenv_parse("MAX_EDGE_DECAY_BPS", 25.0f64);
+    cfg.trading_enabled = getenv_parse("TRADING_ENABLED", true);
+    cfg.trading_control_file = env::var("POLY_CONTROL_FILE").unwrap_or_default();
+    cfg.panic_partial_count = getenv_parse("PANIC_PARTIAL_COUNT", 3u32);
+    cfg.panic_partial_window_s = (getenv_parse("PANIC_PARTIAL_WINDOW_MIN", 10.0f64) * 60.0) as u64;
     cfg
 }
 
-async fn fetch_markets(max_markets_watch: usize, min_liq: f64, min_vol: f64) -> Result<Vec<MarketInfo>> {
+async fn fetch_markets(
+    max_markets_watch: usize,
+    min_liq: f64,
+    min_vol: f64,
+) -> Result<Vec<MarketInfo>> {
     let client = Client::builder().timeout(Duration::from_secs(20)).build()?;
     let mut all = Vec::<MarketInfo>::new();
     let mut offset = 0usize;
@@ -133,7 +148,11 @@ async fn fetch_markets(max_markets_watch: usize, min_liq: f64, min_vol: f64) -> 
             "https://gamma-api.polymarket.com/markets?limit={}&offset={}&active=true&closed=false",
             limit, offset
         );
-        let resp = client.get(&url).send().await.context("gamma fetch failed")?;
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .context("gamma fetch failed")?;
         if !resp.status().is_success() {
             break;
         }
@@ -197,7 +216,11 @@ async fn fetch_markets(max_markets_watch: usize, min_liq: f64, min_vol: f64) -> 
         }
     }
 
-    all.sort_by(|a, b| b.volume.partial_cmp(&a.volume).unwrap_or(std::cmp::Ordering::Equal));
+    all.sort_by(|a, b| {
+        b.volume
+            .partial_cmp(&a.volume)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     all.truncate(max_markets_watch);
     Ok(all)
 }
@@ -205,10 +228,15 @@ async fn fetch_markets(max_markets_watch: usize, min_liq: f64, min_vol: f64) -> 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "polymarket_rust_service=info,polymarket_engine=warn".to_string()))
+        .with_env_filter(
+            std::env::var("RUST_LOG").unwrap_or_else(|_| {
+                "polymarket_rust_service=info,polymarket_engine=warn".to_string()
+            }),
+        )
         .init();
 
-    let dotenv_path = env::var("ENV_FILE").unwrap_or_else(|_| "/opt/polymarket-bot/Arb-Bot/.env".into());
+    let dotenv_path =
+        env::var("ENV_FILE").unwrap_or_else(|_| "/opt/polymarket-bot/Arb-Bot/.env".into());
     load_dotenv(&dotenv_path);
 
     let cfg = build_config();
@@ -249,8 +277,12 @@ async fn main() -> Result<()> {
     while let Some(ev) = rx.recv().await {
         match ev {
             WsEvent::BookUpdate { asset_id } => {
-                let Some(market) = obm.get_market_for_asset(&asset_id) else { continue; };
-                let Some((yes_book, no_book)) = obm.get_market_books(&market) else { continue; };
+                let Some(market) = obm.get_market_for_asset(&asset_id) else {
+                    continue;
+                };
+                let Some((yes_book, no_book)) = obm.get_market_books(&market) else {
+                    continue;
+                };
 
                 let yes_age = yes_book.last_update.elapsed().as_secs_f64();
                 let no_age = no_book.last_update.elapsed().as_secs_f64();
@@ -271,7 +303,10 @@ async fn main() -> Result<()> {
                     cfg.illiquid_threshold_usd,
                 ) {
                     // hot-path dedup + minimal logs (avoid noise)
-                    let prev = last_edge_by_market.get(&opp.market_id).copied().unwrap_or(-999.0);
+                    let prev = last_edge_by_market
+                        .get(&opp.market_id)
+                        .copied()
+                        .unwrap_or(-999.0);
                     if (opp.net_edge_percent - prev).abs() < 0.001 {
                         continue;
                     }
@@ -293,8 +328,8 @@ async fn main() -> Result<()> {
                 }
             }
             WsEvent::Error(e) => error!("ws error: {}", e),
-            WsEvent::Disconnected => {},
-            WsEvent::Connected => {},
+            WsEvent::Disconnected => {}
+            WsEvent::Connected => {}
         }
     }
 

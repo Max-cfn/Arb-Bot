@@ -266,7 +266,9 @@ async def run_rust_hotpath(
                 f"rust_exec status={status}"
                 f"{(' | reason_code=' + reason_code) if reason_code else ''}\n"
                 f"reason_detail={reason}\n"
-                f"durations_ms: sign={float(getattr(res, 'sign_ms', 0.0) or 0.0):.5f} | "
+                f"durations_ms: detect_to_sign={float(getattr(res, 'detect_to_sign_ms', 0.0) or 0.0):.5f} | "
+                f"detect_to_submit={float(getattr(res, 'detect_to_submit_ms', 0.0) or 0.0):.5f} | "
+                f"sign={float(getattr(res, 'sign_ms', 0.0) or 0.0):.5f} | "
                 f"submit={float(getattr(res, 'submit_ms', 0.0) or 0.0):.5f} | "
                 f"total={float(getattr(res, 'total_ms', 0.0) or 0.0):.5f}\n"
                 f"buy_plan(target): YES_qty={yes_qty:.5f} @ ${yes_target_price:.5f} => ${yes_target_notional:.5f} | "
@@ -316,6 +318,12 @@ async def run_rust_hotpath(
     rcfg.cross_bps = float(os.getenv("CLOB_AGGRESSIVE_CROSS_BPS", "5"))
     rcfg.min_order_usd = float(os.getenv("CLOB_MIN_ORDER_USD", "1.0"))
     rcfg.min_order_shares = float(os.getenv("CLOB_MIN_ORDER_SHARES", "5"))
+    rcfg.min_execution_edge_percent = float(os.getenv("MIN_EXECUTION_EDGE_PERCENT", str(rcfg.min_edge_percent)))
+    rcfg.max_edge_decay_bps = float(os.getenv("MAX_EDGE_DECAY_BPS", "25"))
+    rcfg.trading_enabled = os.getenv("TRADING_ENABLED", "1").strip().lower() not in {"0", "false", "off", "no"}
+    rcfg.trading_control_file = os.getenv("POLY_CONTROL_FILE", "")
+    rcfg.panic_partial_count = int(os.getenv("PANIC_PARTIAL_COUNT", "3"))
+    rcfg.panic_partial_window_s = int(float(os.getenv("PANIC_PARTIAL_WINDOW_MIN", "10")) * 60)
     # Complete-or-abort safety parameters (match Python executor defaults)
     rcfg.wait_for_both_ms = int(os.getenv("WAIT_FOR_BOTH_MS", "500"))
     rcfg.poll_interval_ms = int(os.getenv("POLL_INTERVAL_MS", "50"))

@@ -10,13 +10,18 @@ pub mod orderbook;
 pub mod types;
 pub mod ws_client;
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Instant;
 
 use dashmap::DashMap;
 use pyo3::prelude::*;
 use pyo3::types::PyString;
 use tokio::sync::mpsc;
+use tokio::time::{Duration, interval};
 use tracing::{error, info, warn};
 
 use cache::MetaCache;
@@ -24,7 +29,7 @@ use detector::detect_binary_arb;
 use executor::FastExecutor;
 use orderbook::OrderbookManager;
 use types::{EngineConfig, MarketInfo, RustArbOpportunity, RustExecutionResult};
-use ws_client::{run_ws_stream, WsEvent};
+use ws_client::{WsEvent, run_ws_stream};
 
 // ---------------------------------------------------------------------------
 // HotPathEngine — the main class exposed to Python
@@ -38,6 +43,7 @@ pub struct HotPathEngine {
     on_ws_event: Py<PyAny>,
     ob_manager: Arc<OrderbookManager>,
     meta_cache: Arc<MetaCache>,
+    trading_enabled: Arc<AtomicBool>,
 }
 
 #[pymethods]
@@ -50,6 +56,7 @@ impl HotPathEngine {
         on_ws_event: Py<PyAny>,
     ) -> Self {
         let base_url = config.clob_base_url.clone();
+        let trading_enabled = config.trading_enabled;
         Self {
             config,
             on_opportunity,
@@ -57,9 +64,18 @@ impl HotPathEngine {
             on_ws_event,
             ob_manager: Arc::new(OrderbookManager::new()),
             meta_cache: Arc::new(MetaCache::new(&base_url)),
+            trading_enabled: Arc::new(AtomicBool::new(trading_enabled)),
         }
     }
 
+    fn set_trading_enabled(&self, enabled: bool) -> PyResult<()> {
+        self.trading_enabled.store(enabled, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn is_trading_enabled(&self) -> PyResult<bool> {
+        Ok(self.trading_enabled.load(Ordering::Relaxed))
+    }
     /// Load markets from a JSON string. Returns the number of markets loaded.
     fn load_markets(&self, markets_json: &str) -> PyResult<usize> {
         let raw: Vec<serde_json::Value> = serde_json::from_str(markets_json)
@@ -95,6 +111,7 @@ impl HotPathEngine {
         let on_opportunity = self.on_opportunity.clone_ref(py);
         let on_execution = self.on_execution.clone_ref(py);
         let on_ws_event = self.on_ws_event.clone_ref(py);
+        let trading_enabled = Arc::clone(&self.trading_enabled);
 
         // Release the GIL and run the tokio runtime
         py.allow_threads(move || {
@@ -114,27 +131,50 @@ impl HotPathEngine {
                 }
 
                 // Build executor (if credentials present)
-                let fast_executor = if !config.private_key.is_empty()
-                    && !config.private_key.contains("XXXXXX")
-                {
-                    match FastExecutor::new(&config) {
-                        Ok(exec) => {
-                            info!("lib: FastExecutor initialized");
-                            Some(Arc::new(exec))
+                let fast_executor =
+                    if !config.private_key.is_empty() && !config.private_key.contains("XXXXXX") {
+                        match FastExecutor::new(&config) {
+                            Ok(exec) => {
+                                info!("lib: FastExecutor initialized");
+                                Some(Arc::new(exec))
+                            }
+                            Err(e) => {
+                                error!(
+                                    "lib: FastExecutor init failed: {} — running detection-only",
+                                    e
+                                );
+                                None
+                            }
                         }
-                        Err(e) => {
-                            error!("lib: FastExecutor init failed: {} — running detection-only", e);
-                            None
-                        }
-                    }
-                } else {
-                    warn!("lib: no private key configured — detection-only mode");
-                    None
-                };
+                    } else {
+                        warn!("lib: no private key configured — detection-only mode");
+                        None
+                    };
 
                 // Per-market execution cooldown: prevents duplicate executions
                 // Key = market_id, Value = Instant when execution was last started
                 let exec_cooldown: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
+                let partial_failures: Arc<Mutex<VecDeque<Instant>>> =
+                    Arc::new(Mutex::new(VecDeque::new()));
+
+                // Optional control file poller -> updates in-memory atomic killswitch without touching hot path.
+                if !config.trading_control_file.is_empty() {
+                    let kill = Arc::clone(&trading_enabled);
+                    let path = config.trading_control_file.clone();
+                    tokio::spawn(async move {
+                        let mut tick = interval(Duration::from_millis(250));
+                        loop {
+                            tick.tick().await;
+                            if let Ok(raw) = std::fs::read_to_string(&path)
+                                && let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+                                && let Some(enabled) =
+                                    v.get("trading_enabled").and_then(|x| x.as_bool())
+                            {
+                                kill.store(enabled, Ordering::Relaxed);
+                            }
+                        }
+                    });
+                }
 
                 // Set up WS event channel
                 let (event_tx, mut event_rx) = mpsc::unbounded_channel::<WsEvent>();
@@ -203,10 +243,15 @@ impl HotPathEngine {
                                         let market_id = opportunity.market_id.clone();
                                         let cooldown_ms = config.exec_cooldown_ms;
 
+                                        if !trading_enabled.load(Ordering::Relaxed) {
+                                            continue;
+                                        }
+
                                         // Atomic check-and-set: skip if market is in cooldown
                                         let should_exec = {
                                             let now = Instant::now();
-                                            let cooldown_dur = std::time::Duration::from_millis(cooldown_ms);
+                                            let cooldown_dur =
+                                                std::time::Duration::from_millis(cooldown_ms);
                                             match exec_cooldown.entry(market_id.clone()) {
                                                 dashmap::mapref::entry::Entry::Occupied(mut e) => {
                                                     if e.get().elapsed() < cooldown_dur {
@@ -230,12 +275,38 @@ impl HotPathEngine {
                                         let exec = Arc::clone(exec);
                                         let cfg = config.clone();
                                         let mc = Arc::clone(&meta_cache);
-                                        let cb_exec = Python::with_gil(|py| {
-                                            on_execution.clone_ref(py)
-                                        });
+                                        let trading_enabled_flag = Arc::clone(&trading_enabled);
+                                        let partial_failures = Arc::clone(&partial_failures);
+                                        let cb_exec =
+                                            Python::with_gil(|py| on_execution.clone_ref(py));
 
                                         tokio::spawn(async move {
-                                            let result = exec.execute(&opportunity, &cfg, &mc).await;
+                                            let result =
+                                                exec.execute(&opportunity, &cfg, &mc).await;
+
+                                            if result.reason_code.as_deref()
+                                                == Some("FOK_PARTIAL_DETECTED")
+                                            {
+                                                let now = Instant::now();
+                                                let mut should_panic_off = false;
+                                                if let Ok(mut q) = partial_failures.lock() {
+                                                    let cutoff = now
+                                                        - Duration::from_secs(
+                                                            cfg.panic_partial_window_s.max(1),
+                                                        );
+                                                    while q.front().is_some_and(|x| *x < cutoff) {
+                                                        q.pop_front();
+                                                    }
+                                                    q.push_back(now);
+                                                    should_panic_off =
+                                                        q.len() >= cfg.panic_partial_count as usize;
+                                                }
+                                                if should_panic_off {
+                                                    trading_enabled_flag
+                                                        .store(false, Ordering::Relaxed);
+                                                }
+                                            }
+
                                             Python::with_gil(|py| {
                                                 if let Err(e) = cb_exec.call1(py, (result,)) {
                                                     error!("on_execution callback error: {}", e);
@@ -250,10 +321,7 @@ impl HotPathEngine {
                             Python::with_gil(|py| {
                                 let _ = on_ws_event.call1(
                                     py,
-                                    (
-                                        PyString::new(py, "connected"),
-                                        PyString::new(py, ""),
-                                    ),
+                                    (PyString::new(py, "connected"), PyString::new(py, "")),
                                 );
                             });
                         }
@@ -261,10 +329,7 @@ impl HotPathEngine {
                             Python::with_gil(|py| {
                                 let _ = on_ws_event.call1(
                                     py,
-                                    (
-                                        PyString::new(py, "disconnected"),
-                                        PyString::new(py, ""),
-                                    ),
+                                    (PyString::new(py, "disconnected"), PyString::new(py, "")),
                                 );
                             });
                         }
@@ -272,10 +337,7 @@ impl HotPathEngine {
                             Python::with_gil(|py| {
                                 let _ = on_ws_event.call1(
                                     py,
-                                    (
-                                        PyString::new(py, "error"),
-                                        PyString::new(py, &detail),
-                                    ),
+                                    (PyString::new(py, "error"), PyString::new(py, &detail)),
                                 );
                             });
                         }
@@ -304,14 +366,24 @@ impl HotPathEngine {
 
 fn parse_market_from_json(val: &serde_json::Value) -> Option<MarketInfo> {
     let id = val.get("id")?.as_str()?.to_string();
-    let condition_id = val.get("condition_id")
+    let condition_id = val
+        .get("condition_id")
         .or_else(|| val.get("conditionId"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let question = val.get("question").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let slug = val.get("slug").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let end_date = val.get("end_date")
+    let question = val
+        .get("question")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let slug = val
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let end_date = val
+        .get("end_date")
         .or_else(|| val.get("endDate"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
@@ -322,12 +394,14 @@ fn parse_market_from_json(val: &serde_json::Value) -> Option<MarketInfo> {
     if tokens.len() < 2 {
         return None;
     }
-    let yes_token = tokens[0].get("token_id")
+    let yes_token = tokens[0]
+        .get("token_id")
         .or_else(|| tokens[0].get("tokenId"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let no_token = tokens[1].get("token_id")
+    let no_token = tokens[1]
+        .get("token_id")
         .or_else(|| tokens[1].get("tokenId"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
@@ -339,11 +413,17 @@ fn parse_market_from_json(val: &serde_json::Value) -> Option<MarketInfo> {
 
     let volume = val
         .get("volume")
-        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
         .unwrap_or(0.0);
     let liquidity = val
         .get("liquidity")
-        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
         .unwrap_or(0.0);
 
     // Detect crypto 15-min markets by slug pattern
