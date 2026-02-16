@@ -376,11 +376,159 @@ impl FastExecutor {
             );
         }
 
-        // FOK business invariant: if one leg fails, cancel any surviving leg and abort.
+        // FOK business invariant: if one leg POST fails, the surviving order
+        // may have already been filled (FOK fills instantly).  We must check
+        // the surviving order's fill status and unwind if necessary — simply
+        // cancelling is not enough.
         if yes_order_id.is_none() || no_order_id.is_none() {
-            if let Some(surviving) = yes_order_id.as_deref().or(no_order_id.as_deref()) {
-                let _ = self.cancel_orders(&[surviving]).await;
+            let is_yes_surviving = yes_order_id.is_some();
+            let surviving_oid = if is_yes_surviving {
+                yes_order_id.clone().unwrap()
+            } else {
+                no_order_id.clone().unwrap()
+            };
+
+            // Try to cancel the surviving order first.
+            let _ = self.cancel_orders(&[&surviving_oid]).await;
+
+            // Wait briefly, then check if it was already filled before the cancel.
+            sleep(Duration::from_millis(80)).await;
+
+            let mut surviving_filled = 0.0f64;
+            let mut surviving_final_price = 0.0f64;
+            if let Some((_st, sz, px)) = self.get_order_status(&surviving_oid).await {
+                if sz > 0.0 { surviving_filled = sz; }
+                if px > 0.0 { surviving_final_price = px; }
             }
+
+            if surviving_filled > 0.0 {
+                // The surviving order filled before we could cancel.
+                // Try FAK retry on the failed leg, then unwind if retry fails.
+                error!(
+                    "one_leg_failed: surviving {} filled={:.4} — attempting recovery run={}",
+                    if is_yes_surviving { "YES" } else { "NO" },
+                    surviving_filled,
+                    run_id
+                );
+
+                let (retry_token, retry_price, retry_fee_bps, retry_neg_risk) =
+                    if is_yes_surviving {
+                        (&opp.no_token_id, no_price, no_fee_bps, no_neg_risk)
+                    } else {
+                        (&opp.yes_token_id, yes_price, yes_fee_bps, yes_neg_risk)
+                    };
+
+                let retry_ok = self
+                    .retry_buy(
+                        retry_token,
+                        retry_price,
+                        surviving_filled,
+                        retry_fee_bps,
+                        retry_neg_risk,
+                        Duration::from_millis(25),
+                        200,
+                        &run_id,
+                    )
+                    .await;
+
+                if retry_ok {
+                    let (yf, nf, yfp, nfp) = if is_yes_surviving {
+                        (surviving_filled, surviving_filled, surviving_final_price, 0.0)
+                    } else {
+                        (surviving_filled, surviving_filled, 0.0, surviving_final_price)
+                    };
+                    return make_terminal_result(
+                        "FILLED",
+                        &run_id,
+                        &opp.market_id,
+                        yes_order_id,
+                        no_order_id,
+                        format!(
+                            "PARTIAL_RETRY_SUCCESS one_leg_post_failed surviving={} filled={:.4}",
+                            if is_yes_surviving { "YES" } else { "NO" },
+                            surviving_filled
+                        ),
+                        "PARTIAL_RETRY_SUCCESS",
+                        yf,
+                        nf,
+                        yes_price,
+                        no_price,
+                        yfp,
+                        nfp,
+                        sign_ms,
+                        submit_ms,
+                        detect_to_sign_ms,
+                        detect_to_submit_ms,
+                        t_start.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
+
+                // FAK retry failed — emergency unwind the filled leg.
+                let (unwind_token, unwind_price, unwind_neg_risk, unwind_fee_bps, unwind_tick) =
+                    if is_yes_surviving {
+                        (&opp.yes_token_id, yes_price, yes_neg_risk, yes_fee_bps, yes_tick)
+                    } else {
+                        (&opp.no_token_id, no_price, no_neg_risk, no_fee_bps, no_tick)
+                    };
+
+                error!(
+                    "one_leg_failed: FAK retry failed — emergency unwind {}={:.4} run={}",
+                    if is_yes_surviving { "YES" } else { "NO" },
+                    surviving_filled,
+                    run_id
+                );
+
+                let unwind_ok = self
+                    .unwind_sell(
+                        unwind_token,
+                        surviving_filled,
+                        unwind_price,
+                        unwind_neg_risk,
+                        unwind_fee_bps,
+                        unwind_tick,
+                        config.unwind_max_loss_pct,
+                    )
+                    .await;
+
+                let rc = if unwind_ok {
+                    "FOK_EMERGENCY_UNWIND_OK"
+                } else {
+                    "FOK_EMERGENCY_UNWIND_FAILED"
+                };
+
+                let (yf, nf, yfp, nfp) = if is_yes_surviving {
+                    (surviving_filled, 0.0, surviving_final_price, 0.0)
+                } else {
+                    (0.0, surviving_filled, 0.0, surviving_final_price)
+                };
+
+                return make_terminal_result(
+                    "CANCELLED",
+                    &run_id,
+                    &opp.market_id,
+                    yes_order_id,
+                    no_order_id,
+                    format!(
+                        "{rc} one_leg_post_failed surviving={} filled={:.4}",
+                        if is_yes_surviving { "YES" } else { "NO" },
+                        surviving_filled
+                    ),
+                    rc,
+                    yf,
+                    nf,
+                    yes_price,
+                    no_price,
+                    yfp,
+                    nfp,
+                    sign_ms,
+                    submit_ms,
+                    detect_to_sign_ms,
+                    detect_to_submit_ms,
+                    t_start.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+
+            // Surviving order was not filled — safe to just return CANCELLED.
             return make_terminal_result(
                 "CANCELLED",
                 &run_id,
