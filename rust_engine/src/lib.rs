@@ -281,6 +281,39 @@ impl HotPathEngine {
                                             Python::with_gil(|py| on_execution.clone_ref(py));
 
                                         tokio::spawn(async move {
+                                            // Send SUBMITTED notification so the user
+                                            // knows an execution attempt is starting.
+                                            let submitted = RustExecutionResult {
+                                                status: "SUBMITTED".into(),
+                                                run_id: String::new(),
+                                                market_id: opportunity.market_id.clone(),
+                                                yes_order_id: None,
+                                                no_order_id: None,
+                                                reason: "Execution starting — FOK orders being signed and submitted".into(),
+                                                reason_code: Some("SUBMITTED".into()),
+                                                yes_filled_size: 0.0,
+                                                no_filled_size: 0.0,
+                                                yes_target_price: opportunity.yes_best_ask,
+                                                no_target_price: opportunity.no_best_ask,
+                                                yes_final_price: 0.0,
+                                                no_final_price: 0.0,
+                                                sign_ms: 0.0,
+                                                submit_ms: 0.0,
+                                                detect_to_sign_ms: 0.0,
+                                                detect_to_submit_ms: 0.0,
+                                                total_ms: 0.0,
+                                            };
+                                            Python::with_gil(|py| {
+                                                if let Err(e) =
+                                                    cb_exec.call1(py, (submitted,))
+                                                {
+                                                    error!(
+                                                        "on_execution SUBMITTED callback error: {}",
+                                                        e
+                                                    );
+                                                }
+                                            });
+
                                             let result =
                                                 exec.execute(&opportunity, &cfg, &mc).await;
 
