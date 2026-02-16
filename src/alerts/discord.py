@@ -12,6 +12,7 @@ from src.alerts.formatters import (
     format_health_embed,
     format_ops_embed,
     format_opportunity_embed,
+    format_opportunity_expired_embed,
     format_execution_embed,
 )
 from src.config import Config
@@ -34,8 +35,9 @@ class DiscordClient:
             "executions": config.discord_webhook_executions,
         }
         self._last_send: float = 0
+        self._last_send_by_webhook: dict[str, float] = {}
 
-    async def _send(self, webhook_key: str, payload: dict[str, Any]) -> bool:
+    async def _send(self, webhook_key: str, payload: dict[str, Any], *, priority: bool = False) -> bool:
         """Send a payload to the specified webhook."""
         url = self._webhooks.get(webhook_key, "")
         if not url:
@@ -43,11 +45,14 @@ class DiscordClient:
             return False
 
         try:
-            # Basic rate-limit guard
-            now = asyncio.get_event_loop().time()
-            elapsed = now - self._last_send
-            if elapsed < RATE_LIMIT_DELAY:
-                await asyncio.sleep(RATE_LIMIT_DELAY - elapsed)
+            # Basic rate-limit guard (per-webhook).
+            # `priority=True` lets critical events (e.g. SUBMITTED) skip local pacing.
+            if not priority:
+                now = asyncio.get_event_loop().time()
+                last = self._last_send_by_webhook.get(webhook_key, 0.0)
+                elapsed = now - last
+                if elapsed < RATE_LIMIT_DELAY:
+                    await asyncio.sleep(RATE_LIMIT_DELAY - elapsed)
 
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -55,7 +60,9 @@ class DiscordClient:
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
-                    self._last_send = asyncio.get_event_loop().time()
+                    sent_ts = asyncio.get_event_loop().time()
+                    self._last_send = sent_ts
+                    self._last_send_by_webhook[webhook_key] = sent_ts
                     if resp.status == 204:
                         return True
                     if resp.status == 429:
@@ -81,6 +88,17 @@ class DiscordClient:
         )
         return await self._send("opportunities", payload)
 
+    async def send_opportunity_expired(
+        self,
+        opp: ArbitrageOpportunity,
+        *,
+        duration_s: float,
+        last_edge_percent: float | None = None,
+    ) -> bool:
+        """Send a follow-up message when an opportunity seems to have expired."""
+        payload = format_opportunity_expired_embed(opp, duration_s=duration_s, last_edge_percent=last_edge_percent)
+        return await self._send("opportunities", payload)
+
     async def send_execution(
         self,
         opp: ArbitrageOpportunity,
@@ -91,10 +109,13 @@ class DiscordClient:
     ) -> bool:
         """Send a dry-run execution plan (or later real execution status)."""
         payload = format_execution_embed(opp, note=note, run_id=run_id, status=status)
+        # SUBMITTED is time-sensitive: prioritize delivery in executions webhook.
+        is_priority = str(status).upper() in {"SUBMITTED", "PLACED", "SENDING"}
+
         # Prefer executions channel if configured; otherwise fall back to ops.
-        ok = await self._send("executions", payload)
+        ok = await self._send("executions", payload, priority=is_priority)
         if not ok:
-            return await self._send("ops", payload)
+            return await self._send("ops", payload, priority=is_priority)
         return ok
 
     async def send_health(self, status: str, details: dict[str, Any] | None = None) -> bool:

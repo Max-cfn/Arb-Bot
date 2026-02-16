@@ -75,8 +75,11 @@ class PolymarketWebSocket:
                 len(chunks), len(self.asset_ids),
             )
 
-            # Spawn connection tasks
-            self._tasks = [asyncio.create_task(self._run_connection(chunk)) for chunk in chunks]
+            # Spawn connection tasks with staggered start to avoid rate limits
+            self._tasks = []
+            for chunk in chunks:
+                self._tasks.append(asyncio.create_task(self._run_connection(chunk)))
+                await asyncio.sleep(1.5)  # Stagger connections
 
             # Wait until a refresh is requested or until any task fails/exits
             refresh_wait = asyncio.create_task(self._refresh_event.wait())

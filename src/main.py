@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 import time
+import threading
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -41,11 +42,18 @@ WS_PROBE_MAX_MSGS = 4
 # Trading control (killswitch)
 CONTROL_FILE = Path(os.getenv("POLY_CONTROL_FILE", "data/control.json"))
 
-# One-shot execution (safety): automatically disable trading after first execution attempt
+# One-shot execution (safety): automatically disable trading after N execution attempts
+# - If MAX_ONE_SHOT_TRADES>0, trading will be disabled after that many attempts.
+# - Back-compat: ONE_SHOT_TRADE=1 implies MAX_ONE_SHOT_TRADES=1 unless explicitly set.
 ONE_SHOT_TRADE = os.getenv("ONE_SHOT_TRADE", "0").strip() in {"1", "true", "True", "yes", "YES"}
+try:
+    MAX_ONE_SHOT_TRADES = int(os.getenv("MAX_ONE_SHOT_TRADES", "1" if ONE_SHOT_TRADE else "0").strip())
+except Exception:
+    MAX_ONE_SHOT_TRADES = 1 if ONE_SHOT_TRADE else 0
 
 # Execution mode: dry-run (default) or real
 EXECUTION_MODE = os.getenv("EXECUTION_MODE", "dryrun").strip().lower()
+RUST_HOTPATH_ENABLED = os.getenv("RUST_HOTPATH_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 
 
@@ -88,6 +96,247 @@ def set_trading_enabled(enabled: bool) -> None:
         logger.error("Failed to write control file %s: %s", CONTROL_FILE, exc)
 
 
+async def run_rust_hotpath(
+    *,
+    discord: DiscordClient,
+    db: Database,
+    config,
+    markets: list[dict],
+) -> None:
+    """Run Rust WS + detection + submission in-process, keep Python alerting/DB.
+
+    Single-service mode: Python process stays the only systemd service.
+    """
+    from datetime import datetime, timezone
+    from src.detector.base import ArbitrageOpportunity
+
+    try:
+        from polymarket_engine import EngineConfig, HotPathEngine
+    except Exception as exc:
+        raise RuntimeError(f"Rust engine import failed (install extension first): {exc}")
+
+    loop = asyncio.get_running_loop()
+
+    market_rank: dict[str, tuple[int, int]] = {}
+    for m in markets:
+        mid = str(m.get("id") or "")
+        if not mid:
+            continue
+        market_rank[mid] = (
+            int(m.get("market_rank_idx", 0) or 0),
+            int(m.get("market_total_count", 0) or 0),
+        )
+
+    alert_last: dict[str, tuple[float, float]] = {}
+    last_opp_by_market: dict[str, ArbitrageOpportunity] = {}
+    exec_last_sent: dict[tuple[str, str], float] = {}
+    exec_suppressed: dict[tuple[str, str], int] = {}
+
+    def _to_py_opp(ropp) -> ArbitrageOpportunity:
+        opp = ArbitrageOpportunity(
+            market_id=str(getattr(ropp, "market_id", "")),
+            market_question=str(getattr(ropp, "market_question", "")),
+            yes_token_id=str(getattr(ropp, "yes_token_id", "")),
+            no_token_id=str(getattr(ropp, "no_token_id", "")),
+            condition_id=str(getattr(ropp, "condition_id", "")),
+            slug=str(getattr(ropp, "slug", "")),
+            end_date=str(getattr(ropp, "end_date", "")),
+            yes_best_ask=float(getattr(ropp, "yes_best_ask", 0.0) or 0.0),
+            no_best_ask=float(getattr(ropp, "no_best_ask", 0.0) or 0.0),
+            combined_best_asks=float(getattr(ropp, "combined_best_asks", 0.0) or 0.0),
+            one_share_net_profit=float(getattr(ropp, "one_share_net_profit", 0.0) or 0.0),
+            one_share_net_edge_percent=float(getattr(ropp, "one_share_net_edge_percent", 0.0) or 0.0),
+            yes_ask_vwap=float(getattr(ropp, "yes_ask_vwap", 0.0) or 0.0),
+            no_ask_vwap=float(getattr(ropp, "no_ask_vwap", 0.0) or 0.0),
+            combined_cost=float(getattr(ropp, "combined_cost", 0.0) or 0.0),
+            gross_edge=float(getattr(ropp, "gross_edge", 0.0) or 0.0),
+            gross_edge_percent=float(getattr(ropp, "gross_edge_percent", 0.0) or 0.0),
+            net_edge=float(getattr(ropp, "net_edge", 0.0) or 0.0),
+            net_edge_percent=float(getattr(ropp, "net_edge_percent", 0.0) or 0.0),
+            size_usd=float(getattr(ropp, "size_usd", 0.0) or 0.0),
+            yes_liquidity=float(getattr(ropp, "yes_liquidity", 0.0) or 0.0),
+            no_liquidity=float(getattr(ropp, "no_liquidity", 0.0) or 0.0),
+            max_safe_size=float(getattr(ropp, "max_safe_size", 0.0) or 0.0),
+            timestamp=datetime.now(timezone.utc),
+            is_crypto_15min=bool(getattr(ropp, "is_crypto_15min", False)),
+            verdict=str(getattr(ropp, "verdict", "SKIP")),
+            yes_book_age_s=float(getattr(ropp, "yes_book_age_s", 0.0) or 0.0),
+            no_book_age_s=float(getattr(ropp, "no_book_age_s", 0.0) or 0.0),
+        )
+        rank_idx, total = market_rank.get(opp.market_id, (0, 0))
+        opp.market_rank_idx = rank_idx
+        opp.market_total_count = total
+        return opp
+
+    def _passes_time_gates(opp: ArbitrageOpportunity) -> bool:
+        try:
+            end_raw = (opp.end_date or "").strip()
+            if not end_raw:
+                return False
+            end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            hours_left = (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+            if hours_left <= 0 or hours_left > 24:
+                return False
+            min_net = 2.0 if hours_left < 0.25 else (3.5 if hours_left < 4.0 else 5.0)
+            return bool(opp.net_edge_percent > min_net)
+        except Exception:
+            return False
+
+    def on_opportunity(ropp) -> None:
+        try:
+            opp = _to_py_opp(ropp)
+            # Keep latest opp cached for execution callback even if this opp is filtered for alerts.
+            last_opp_by_market[opp.market_id] = opp
+
+            if not _passes_time_gates(opp):
+                return
+
+            now_ts = time.time()
+            prev = alert_last.get(opp.market_id)
+            if prev is not None and abs(opp.net_edge_percent - prev[0]) < 0.001:
+                return
+            alert_last[opp.market_id] = (opp.net_edge_percent, now_ts)
+
+            asyncio.run_coroutine_threadsafe(db.log_opportunity(opp), loop)
+            asyncio.run_coroutine_threadsafe(discord.send_opportunity(opp), loop)
+        except Exception as exc:
+            logger.error("Rust on_opportunity callback failed: %s", exc)
+
+    def on_execution(res) -> None:
+        try:
+            import math
+
+            mid = str(getattr(res, "market_id", ""))
+            opp = last_opp_by_market.get(mid)
+            if not opp:
+                return
+
+            status = str(getattr(res, "status", "FAILED"))
+            reason = str(getattr(res, "reason", ""))
+            reason_code = str(getattr(res, "reason_code", "") or "")
+
+            # Sizing plan used by Rust executor: min 5 shares and min $1 per leg.
+            yes_price = float(getattr(opp, "yes_best_ask", 0.0) or 0.0)
+            no_price = float(getattr(opp, "no_best_ask", 0.0) or 0.0)
+            min_order_usd = float(os.getenv("CLOB_MIN_ORDER_USD", "1.0"))
+            min_order_shares = float(os.getenv("CLOB_MIN_ORDER_SHARES", "5"))
+
+            shares_yes_usd = int(math.ceil(min_order_usd / yes_price)) if yes_price > 0 else 0
+            shares_no_usd = int(math.ceil(min_order_usd / no_price)) if no_price > 0 else 0
+            shares = int(max(5, math.ceil(min_order_shares), shares_yes_usd, shares_no_usd))
+
+            yes_qty = float(shares)
+            no_qty = float(shares)
+
+            yes_target_price = float(getattr(res, "yes_target_price", yes_price) or yes_price)
+            no_target_price = float(getattr(res, "no_target_price", no_price) or no_price)
+            yes_final_price = float(getattr(res, "yes_final_price", 0.0) or 0.0)
+            no_final_price = float(getattr(res, "no_final_price", 0.0) or 0.0)
+
+            yes_target_notional = yes_qty * yes_target_price
+            no_target_notional = no_qty * no_target_price
+            total_target_notional = yes_target_notional + no_target_notional
+
+            # Anti-spam: throttle repetitive failure/partial events per market+status.
+            now_ts = time.time()
+            throttle_window_s = float(os.getenv("EXEC_ALERT_THROTTLE_SECONDS", "15"))
+            throttle_key = (mid, status)
+            should_send = True
+            suppressed_now = 0
+
+            if status in {"FAILED", "PARTIAL_SUBMIT", "CANCELLED"}:
+                last_ts = exec_last_sent.get(throttle_key, 0.0)
+                if now_ts - last_ts < throttle_window_s:
+                    exec_suppressed[throttle_key] = exec_suppressed.get(throttle_key, 0) + 1
+                    should_send = False
+                else:
+                    suppressed_now = exec_suppressed.pop(throttle_key, 0)
+                    exec_last_sent[throttle_key] = now_ts
+            else:
+                # For positive states, always send and reset suppression counter.
+                suppressed_now = exec_suppressed.pop(throttle_key, 0)
+                exec_last_sent[throttle_key] = now_ts
+
+            if not should_send:
+                return
+
+            note = (
+                f"rust_exec status={status}"
+                f"{(' | reason_code=' + reason_code) if reason_code else ''}\n"
+                f"reason_detail={reason}\n"
+                f"durations_ms: sign={float(getattr(res, 'sign_ms', 0.0) or 0.0):.5f} | "
+                f"submit={float(getattr(res, 'submit_ms', 0.0) or 0.0):.5f} | "
+                f"total={float(getattr(res, 'total_ms', 0.0) or 0.0):.5f}\n"
+                f"buy_plan(target): YES_qty={yes_qty:.5f} @ ${yes_target_price:.5f} => ${yes_target_notional:.5f} | "
+                f"NO_qty={no_qty:.5f} @ ${no_target_price:.5f} => ${no_target_notional:.5f}\n"
+                f"sum_target=${total_target_notional:.5f} (constraints: min_shares>=5, min_notional_per_leg>=${min_order_usd:.2f})\n"
+                f"buy_price_final: YES=${yes_final_price:.5f} | NO=${no_final_price:.5f} (0.00000 = non rempli/non dispo)"
+            )
+            if suppressed_now > 0:
+                note += f"\n(throttle) {suppressed_now} events similaires supprimés dans les {throttle_window_s:.0f}s"
+
+            asyncio.run_coroutine_threadsafe(
+                discord.send_execution(
+                    opp,
+                    note=note,
+                    run_id=str(getattr(res, "run_id", "")),
+                    status=status,
+                ),
+                loop,
+            )
+        except Exception as exc:
+            logger.error("Rust on_execution callback failed: %s", exc)
+
+    def on_ws_event(kind, detail) -> None:
+        # Keep this quiet by default; only surface real WS errors.
+        try:
+            if str(kind) == "error" and str(detail).strip():
+                asyncio.run_coroutine_threadsafe(discord.send_ops(f"Rust WS error: {detail}"), loop)
+        except Exception:
+            pass
+
+    rcfg = EngineConfig()
+    rcfg.clob_base_url = os.getenv("CLOB_BASE_URL", "https://clob.polymarket.com")
+    rcfg.ws_url = os.getenv("WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market")
+    rcfg.private_key = os.getenv("CLOB_PRIVATE_KEY", "")
+    rcfg.funder_address = os.getenv("CLOB_FUNDER_ADDRESS", "")
+    rcfg.api_key = os.getenv("CLOB_API_KEY", "")
+    rcfg.api_secret = os.getenv("CLOB_API_SECRET", "")
+    rcfg.api_passphrase = os.getenv("CLOB_API_PASSPHRASE", "")
+    rcfg.chain_id = int(os.getenv("CLOB_CHAIN_ID", "137"))
+    rcfg.signature_type = int(os.getenv("CLOB_SIGNATURE_TYPE", "0"))
+    rcfg.min_edge_percent = float(config.min_edge_percent)
+    rcfg.min_liquidity_usd = float(config.min_liquidity_usd)
+    rcfg.buffer_liquid_percent = float(config.buffer_liquid_percent)
+    rcfg.buffer_illiquid_percent = float(config.buffer_illiquid_percent)
+    rcfg.illiquid_threshold_usd = float(config.illiquid_threshold_usd)
+    rcfg.target_size_usd = float(config.target_size_usd)
+    rcfg.cross_bps = float(os.getenv("CLOB_AGGRESSIVE_CROSS_BPS", "5"))
+    rcfg.min_order_usd = float(os.getenv("CLOB_MIN_ORDER_USD", "1.0"))
+    rcfg.min_order_shares = float(os.getenv("CLOB_MIN_ORDER_SHARES", "5"))
+    # Complete-or-abort safety parameters (match Python executor defaults)
+    rcfg.wait_for_both_ms = int(os.getenv("WAIT_FOR_BOTH_MS", "500"))
+    rcfg.poll_interval_ms = int(os.getenv("POLL_INTERVAL_MS", "50"))
+    rcfg.retry_duration_ms = int(os.getenv("RETRY_DURATION_MS", "200"))
+    rcfg.retry_slippage_pct = float(os.getenv("RETRY_SLIPPAGE_PERCENT", "1.5"))
+    rcfg.unwind_max_loss_pct = float(os.getenv("UNWIND_MAX_LOSS_PERCENT", "3.0"))
+
+    engine = HotPathEngine(rcfg, on_opportunity, on_execution, on_ws_event)
+    loaded = engine.load_markets(json.dumps(markets))
+    if loaded <= 0:
+        raise RuntimeError("Rust engine loaded 0 markets")
+
+    await discord.send_ops(f"Rust hotpath enabled in single-service mode: {loaded} markets")
+
+    t = threading.Thread(target=engine.start, daemon=True, name="rust-hotpath")
+    t.start()
+
+    # Keep coroutine alive forever; this task represents the hotpath lifecycle.
+    while True:
+        await asyncio.sleep(3600)
+
 
 async def periodic_health_check(
     discord: DiscordClient,
@@ -122,6 +371,10 @@ def select_markets(
 
     Aggressive OR filter: keep markets with liquidity>=min_liquidity_usd OR volume>=min_volume_usd.
     Then sort by volume descending (priority to activity) and take top max_markets.
+
+    Also annotates each selected market with rank metadata:
+    - market_rank_idx (1-based)
+    - market_total_count
     """
     filtered = [
         m for m in markets
@@ -133,7 +386,12 @@ def select_markets(
         key=lambda m: float(m.get("volume", 0) or 0),
         reverse=True,
     )
-    return filtered[:max_markets]
+    selected = filtered[:max_markets]
+    total = len(selected)
+    for i, m in enumerate(selected, start=1):
+        m["market_rank_idx"] = i
+        m["market_total_count"] = total
+    return selected
 
 
 async def periodic_market_refresh(
@@ -224,9 +482,21 @@ async def periodic_6h_summary(
     discord: DiscordClient,
     db: Database,
 ) -> None:
-    """Send a rolling 24h stats ping every 6 hours, including delta vs last ping."""
-    from pathlib import Path
+    """Send a rolling 24h stats ping on fixed 6h boundaries, incl. delta vs last ping.
 
+    Why:
+    - The old implementation used `sleep(6h)` which drifts with restarts and runtime delays.
+    - We want absolute times (e.g. 00:00/06:00/12:00/18:00 in the chosen TZ).
+
+    State:
+    - We persist the previous ping totals in `data/rolling_stats.json` so the next ping can
+      reference the previous one. If that file isn't writable (permissions), deltas will
+      always show "first ping".
+    """
+    from pathlib import Path
+    from datetime import timedelta
+
+    tz = ZoneInfo(os.getenv("ROLLING_STATS_TZ", os.getenv("DAILY_SUMMARY_TZ", "Europe/Paris")))
     state_path = Path(os.getenv("ROLLING_STATS_STATE", "data/rolling_stats.json"))
 
     def _load_state() -> dict:
@@ -241,11 +511,24 @@ async def periodic_6h_summary(
             import json
             state_path.parent.mkdir(parents=True, exist_ok=True)
             state_path.write_text(json.dumps(st, indent=2) + "\n")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to persist rolling stats state (%s): %s", state_path, exc)
+
+    def _next_boundary(now_local: datetime) -> datetime:
+        # Next boundary at hour in {0,6,12,18}
+        h = now_local.hour
+        next_h = ((h // 6) + 1) * 6
+        if next_h >= 24:
+            base = now_local.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        else:
+            base = now_local.replace(hour=next_h, minute=0, second=0, microsecond=0)
+        return base
 
     while True:
-        await asyncio.sleep(6 * 3600)
+        now_local = datetime.now(tz)
+        nxt = _next_boundary(now_local)
+        await asyncio.sleep(max(0.0, (nxt - now_local).total_seconds()))
+
         try:
             stats_24h = await db.get_stats_last_24h()
             st = _load_state()
@@ -261,14 +544,14 @@ async def periodic_6h_summary(
                     delta_pct = None
 
             msg = {
-                "Window": "Rolling 24h (6h ping)",
+                "Window": f"Rolling 24h (6h ping) | {tz.key} @ {datetime.now(tz).strftime('%H:%M')}",
                 "Last 24h total": cur_total,
                 "Last 24h actionable": stats_24h.get("actionable", 0),
                 "Avg edge %": stats_24h.get("avg_edge", 0),
                 "Max edge %": stats_24h.get("max_edge", 0),
             }
             if delta_pct is None:
-                msg["Δ total vs prev"] = "n/a (first ping)"
+                msg["Δ total vs prev"] = "n/a (first ping or state not writable)"
             else:
                 msg["Δ total vs prev"] = f"{delta_pct:+.1f}%"
 
@@ -347,6 +630,42 @@ async def ws_probe_subscriptions(discord: DiscordClient, asset_ids: list[str]) -
 
         await discord.send_ops("\n".join(lines))
         await asyncio.sleep(1)
+
+
+async def periodic_clob_http_probe(discord: DiscordClient) -> None:
+    """Periodically probe the CLOB HTTP endpoint to detect network issues.
+
+    Enabled by env: CLOB_HTTP_PROBE=1
+
+    Behavior:
+    - logs latency + status to OPS only on failures (to avoid spam)
+    - helps diagnose PolyApiException(status_code=None, Request exception!)
+    """
+    if os.getenv("CLOB_HTTP_PROBE", "0").strip() not in {"1", "true", "True", "yes", "YES"}:
+        return
+
+    import aiohttp
+
+    url = os.getenv("CLOB_BASE_URL", "https://clob.polymarket.com").rstrip("/") + "/"
+    fail_streak = 0
+
+    while True:
+        await asyncio.sleep(60)
+        t0 = time.time()
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    dt = (time.time() - t0) * 1000
+                    if resp.status >= 400:
+                        fail_streak += 1
+                        await discord.send_ops(f"CLOB_HTTP_PROBE fail status={resp.status} latency_ms={dt:.0f} streak={fail_streak}")
+                    else:
+                        fail_streak = 0
+        except Exception as exc:
+            dt = (time.time() - t0) * 1000
+            fail_streak += 1
+            await discord.send_ops(f"CLOB_HTTP_PROBE exception latency_ms={dt:.0f} streak={fail_streak} err={exc}")
 
 
 async def periodic_ops_debug(
@@ -476,6 +795,11 @@ async def main() -> None:
     detector = BinaryArbDetector(config)
     target_size_usd = config.target_size_usd
 
+    # --- Execution (REAL) ---
+    # Always instantiate the executor so EXECUTION_MODE can be flipped without code changes.
+    # The executor itself will refuse to trade if creds are missing/placeholders.
+    executor = PolymarketClobExecutor()
+
     # Startup health message
     ip = geo["ip"]
     await discord.send_health("Starting", {
@@ -484,6 +808,53 @@ async def main() -> None:
         "Country": geo["country"],
         "Min edge": f"{config.min_edge_percent}%",
     })
+
+    if RUST_HOTPATH_ENABLED:
+        logger.info("Single-service mode: Rust hotpath enabled")
+
+        shutdown_event = asyncio.Event()
+
+        def _signal_handler() -> None:
+            logger.info("Shutdown signal received")
+            shutdown_event.set()
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _signal_handler)
+            except NotImplementedError:
+                pass
+
+        tasks = [
+            asyncio.create_task(periodic_6h_summary(discord, db), name="summary_6h"),
+            asyncio.create_task(daily_summary_task(discord, db, start_time), name="daily_summary"),
+            asyncio.create_task(periodic_db_purge(db), name="db_purge"),
+            asyncio.create_task(
+                run_rust_hotpath(
+                    discord=discord,
+                    db=db,
+                    config=config,
+                    markets=markets,
+                ),
+                name="rust_hotpath",
+            ),
+        ]
+
+        try:
+            shutdown_task = asyncio.create_task(shutdown_event.wait())
+            done, _ = await asyncio.wait([*tasks, shutdown_task], return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                if t != shutdown_task and t.exception():
+                    logger.error("Task %s failed: %s", t.get_name(), t.exception())
+                    await discord.send_ops(f"Task failed: {t.get_name()} :: {t.exception()}")
+        finally:
+            logger.info("Shutting down (rust single-service mode)...")
+            for t in tasks:
+                t.cancel()
+            await db.close()
+            await discord.send_health("Stopped", {"reason": "shutdown"})
+            logger.info("Bot stopped.")
+        return
 
     # --- Orderbook update callback ---
     last_ops_sample: float = 0.0
@@ -569,6 +940,32 @@ async def main() -> None:
             except Exception:
                 continue
 
+            # Attach rank metadata from market selection (for opportunity embed)
+            try:
+                opp.market_rank_idx = int(market.get("market_rank_idx", 0) or 0)
+                opp.market_total_count = int(market.get("market_total_count", 0) or 0)
+            except Exception:
+                opp.market_rank_idx = 0
+                opp.market_total_count = 0
+
+            # --- ALERT DEDUP (avoid spamming identical edges) ---
+            # Only re-alert a market if the net edge changes by >= 0.001 percentage points.
+            try:
+                if not hasattr(on_orderbook_update, "_alert_last"):  # type: ignore[attr-defined]
+                    on_orderbook_update._alert_last = {}  # type: ignore[attr-defined]
+
+                last_info = on_orderbook_update._alert_last.get(opp.market_id)  # type: ignore[attr-defined]
+                now_ts = time.time()
+                if last_info is not None:
+                    last_edge, _last_ts = last_info
+                    if abs(float(opp.net_edge_percent) - float(last_edge)) < 0.001:
+                        continue
+
+                on_orderbook_update._alert_last[opp.market_id] = (float(opp.net_edge_percent), now_ts)  # type: ignore[attr-defined]
+            except Exception:
+                # On any dedup bookkeeping issue, fall back to alerting.
+                pass
+
             # Enrich opportunity with fee diagnostics (fast: cached; only called on actual opps)
             try:
                 from src.scanner.fee_rate import get_fee_rate_bps
@@ -591,9 +988,16 @@ async def main() -> None:
                 opp.taker_fee_rate_percent_no = _fee_rate_percent(opp.no_ask_vwap, opp.fee_rate_bps_no)
             except Exception:
                 pass
-            # Always emit opportunity alert + DB log, but NEVER block the trading path on Discord/IO
-            asyncio.create_task(discord.send_opportunity(opp), name=f"alert-opp-{opp.market_id}")
+            # (disabled) Edge lifetime follow-up message was too noisy / low-signal at WS sampling frequency.
+            # Keeping the state map removed for now.
+
+            # Performance: do NOT write to DB or spam Discord for SKIP updates.
+            # We only emit an "expired" message when an edge drops below the floor.
+            if opp.verdict == "SKIP":
+                continue
+
             asyncio.create_task(db.log_opportunity(opp), name=f"db-opp-{opp.market_id}")
+            asyncio.create_task(discord.send_opportunity(opp), name=f"alert-opp-{opp.market_id}")
 
             # --- AUTOMATION: ATTEMPT EXECUTION IMMEDIATELY ---
             # If killswitch is OFF, we keep scanning/alerting but do not emit execution/trading actions.
@@ -605,8 +1009,13 @@ async def main() -> None:
                     on_orderbook_update._exec_last = {}  # type: ignore[attr-defined]
                 last = on_orderbook_update._exec_last.get(opp.market_id, 0)  # type: ignore[attr-defined]
                 now_ts = time.time()
-                if now_ts - last > 60:
+                dedup_s = float(os.getenv("EXEC_DEDUP_SECONDS", "0"))
+                if now_ts - last > dedup_s:
                     on_orderbook_update._exec_last[opp.market_id] = now_ts  # type: ignore[attr-defined]
+
+                    # Always define a run_id for both real and dry-run paths
+                    run_id = f"{opp.market_id}-{int(now_ts)}"
+
                     t_detect_ns = getattr(opp, "_t_detect_ns", None)
                     t_send_ns = time.monotonic_ns()
                     t_submit_ns = t_send_ns  # alias for clarity
@@ -621,35 +1030,145 @@ async def main() -> None:
                         f"{detect_to_send_ms:.3f}" if detect_to_send_ms is not None else "n/a",
                     )
 
-                    # One-shot safety: as soon as we decide to attempt an execution, flip killswitch OFF.
-                    if ONE_SHOT_TRADE:
-                        set_trading_enabled(False)
-                        asyncio.create_task(
-                            discord.send_ops(f"ONE_SHOT_TRADE: disabled trading after first execution attempt (market {opp.market_id})."),
-                            name="ops-oneshot",
-                        )
+                    # One-shot safety: as soon as we decide to attempt an execution, flip trading OFF
+                    # after MAX_ONE_SHOT_TRADES attempts.
+                    if MAX_ONE_SHOT_TRADES > 0:
+                        if not hasattr(on_orderbook_update, "_oneshot_count"):  # type: ignore[attr-defined]
+                            on_orderbook_update._oneshot_count = 0  # type: ignore[attr-defined]
+                        on_orderbook_update._oneshot_count += 1  # type: ignore[attr-defined]
+                        n = int(on_orderbook_update._oneshot_count)  # type: ignore[attr-defined]
+
+                        if n >= MAX_ONE_SHOT_TRADES:
+                            set_trading_enabled(False)
+                            asyncio.create_task(
+                                discord.send_ops(
+                                    f"ONE_SHOT_TRADE: disabled trading after execution attempt {n}/{MAX_ONE_SHOT_TRADES} (market {opp.market_id})."
+                                ),
+                                name="ops-oneshot",
+                            )
+                        else:
+                            asyncio.create_task(
+                                discord.send_ops(
+                                    f"ONE_SHOT_TRADE: attempt {n}/{MAX_ONE_SHOT_TRADES} (market {opp.market_id}); trading remains enabled."
+                                ),
+                                name="ops-oneshot-progress",
+                            )
 
                     if EXECUTION_MODE == "real":
                         metrics = ExecutionMetrics(t_detect_ns=t_detect_ns, t_submit_ns=t_submit_ns)
-                        # NOTE: do NOT block on Discord here; real execution handles its own acks/fills.
-                        res = await executor.execute_two_leg(opp, run_id=run_id, metrics=metrics)
-                        # Minimal reporting (async)
+
+                        # Pre-compute an explicit estimate for: shares + attempted cost (USD) so #executions is actionable.
+                        import math
+
+                        min_order_usd = float(os.getenv("CLOB_MIN_ORDER_USD", "1.0"))
+                        min_order_shares = float(os.getenv("CLOB_MIN_ORDER_SHARES", "5"))
+                        min_shares = float(getattr(executor, "min_shares", 1.0))
+                        cross_bps = float(getattr(executor, "cross_bps", 0.0))
+
+                        yes_best = float(getattr(opp, "yes_best_ask", 0.0) or 0.0)
+                        no_best = float(getattr(opp, "no_best_ask", 0.0) or 0.0)
+                        cheaper = min(yes_best, no_best) if yes_best > 0 and no_best > 0 else max(yes_best, no_best)
+                        shares_for_min_notional = int(math.ceil(min_order_usd / cheaper)) if cheaper and cheaper > 0 else 1
+                        shares = int(max(math.ceil(min_shares), math.ceil(min_order_shares), shares_for_min_notional))
+
+                        def _aggressive_buy_limit(p: float) -> float:
+                            if p <= 0:
+                                return p
+                            bumped = p * (1.0 + (cross_bps / 10_000.0))
+                            return float(min(0.9999, max(0.0001, bumped)))
+
+                        yes_limit_est = _aggressive_buy_limit(yes_best)
+                        no_limit_est = _aggressive_buy_limit(no_best)
+                        attempted_cost_usd = float(shares * (yes_limit_est + no_limit_est))
+
+                        # Send an immediate "attempt" message so #executions reflects real order attempts.
                         asyncio.create_task(
                             discord.send_execution(
                                 opp,
                                 note=(
-                                    f"REAL_EXEC status={res.status}\n"
-                                    + (f"reason={res.reason}\n" if res.reason else "")
+                                    "REAL_EXEC attempt: placing YES+NO buy orders now\n"
+                                    f"balance_usd=? (next msg) | attempted_cost_usd≈{attempted_cost_usd:.4f}\n"
+                                    f"shares={shares} (YES+NO) | yes_limit≈{yes_limit_est:.4f} no_limit≈{no_limit_est:.4f}\n"
+                                    f"inputs(best): yes={yes_best:.4f} no={no_best:.4f} | min_order_usd={min_order_usd} min_order_shares={min_order_shares} cross_bps={cross_bps}"
+                                ),
+                                run_id=run_id,
+                                status="SUBMITTED",
+                            ),
+                            name=f"exec-real-attempt-{opp.market_id}",
+                        )
+
+                        async def _real_execute_and_report() -> None:
+                            # Best-effort balance/allowance snapshot (for #executions visibility)
+                            bal_summary = None
+                            bal_usd = None
+                            try:
+                                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+                                client = executor._get_client()  # uses API creds; does NOT place orders
+                                params = BalanceAllowanceParams(
+                                    asset_type=AssetType.COLLATERAL,
+                                    signature_type=int(getattr(executor, "signature_type", 0)),
+                                )
+                                try:
+                                    await asyncio.to_thread(lambda: client.update_balance_allowance(params))
+                                except Exception:
+                                    pass
+                                bal = await asyncio.to_thread(lambda: client.get_balance_allowance(params))
+
+                                # CLOB returns collateral balance in micro-units (1e6 = $1)
+                                if isinstance(bal, dict) and "balance" in bal:
+                                    bal_usd = int(str(bal.get("balance") or "0")) / 1_000_000.0
+                                    bal_summary = f"balance_usd={bal_usd:.6f} allowances_n={len(bal.get('allowances') or {}) if isinstance(bal.get('allowances'), dict) else 'n/a'}"
+                                else:
+                                    bal_summary = str(bal)[:500]
+                            except Exception:
+                                bal_summary = None
+
+                            call_start_ns = time.monotonic_ns()
+                            res = await executor.execute_two_leg(opp, run_id=run_id, metrics=metrics)
+                            call_end_ns = time.monotonic_ns()
+                            call_ms = (call_end_ns - call_start_ns) / 1e6
+
+                            submit_to_ack_ms = None
+                            try:
+                                if res.metrics and isinstance(res.metrics.t_ack_ns, int) and isinstance(res.metrics.t_submit_ns, int):
+                                    submit_to_ack_ms = (res.metrics.t_ack_ns - res.metrics.t_submit_ns) / 1e6
+                            except Exception:
+                                submit_to_ack_ms = None
+
+                            await discord.send_execution(
+                                opp,
+                                note=(
+                                    f"REAL_EXEC result status={res.status}\n"
+                                    + (f"reason={getattr(res, 'reason_code', None) or 'n/a'}\n")
+                                    + (f"detail={res.reason}\n" if getattr(res, 'reason', '') else "")
+                                    + (
+                                        f"balance_usd={bal_usd:.6f} | attempted_cost_usd≈{attempted_cost_usd:.4f}\n"
+                                        if bal_usd is not None
+                                        else f"attempted_cost_usd≈{attempted_cost_usd:.4f}\n"
+                                    )
+                                    + (
+                                        f"shares={shares} | yes_limit≈{yes_limit_est:.4f} no_limit≈{no_limit_est:.4f}\n"
+                                    )
+                                    + (
+                                        f"yes_filled_size={getattr(res, 'yes_filled_size', None)} | "
+                                        f"no_filled_size={getattr(res, 'no_filled_size', None)}\n"
+                                    )
+                                    + (
+                                        f"timings: detect→submit={f'{detect_to_send_ms:.1f}ms' if detect_to_send_ms is not None else 'n/a'} | "
+                                        f"submit→ack={f'{submit_to_ack_ms:.1f}ms' if submit_to_ack_ms is not None else 'n/a'} | "
+                                        f"exec_call={call_ms:.1f}ms\n"
+                                    )
+                                    + (f"balance/allowance={bal_summary}\n" if bal_summary else "")
                                 ),
                                 run_id=run_id,
                                 status=res.status if res.status in {"SUBMITTED","WAITING","FILLED","CANCELLED","FAILED"} else "FAILED",
-                            ),
-                            name=f"exec-real-report-{opp.market_id}",
-                        )
-                        return
+                            )
+
+                        asyncio.create_task(_real_execute_and_report(), name=f"exec-real-{opp.market_id}")
+                        continue
 
                     # Simulated state machine (dry-run for now): SUBMITTED -> WAITING -> CANCELLED
-                    run_id = f"{opp.market_id}-{int(now_ts)}"
                     note0 = "Strategy: strict limit, send both ASAP; cancel fast; if single-fill => unwind immediately (dry-run)."
                     if detect_to_send_ms is not None:
                         note0 += f"\nLatency: detect→submit {detect_to_send_ms:.3f}ms"
@@ -704,6 +1223,9 @@ async def main() -> None:
 
     # --- WebSocket client ---
     asset_ids = extract_all_token_ids(markets)
+    # De-duplicate asset IDs to avoid subscribing multiple times to the same asset.
+    # Preserve order for stable chunking.
+    asset_ids = list(dict.fromkeys(asset_ids))
 
     if WS_PROBE_ON_START:
         # Fire-and-forget probe (bounded). Helps us discover correct subscribe format.
@@ -755,6 +1277,7 @@ async def main() -> None:
     tasks = [
         asyncio.create_task(periodic_6h_summary(discord, db), name="summary_6h"),
         asyncio.create_task(ws_client.connect(), name="websocket"),
+        asyncio.create_task(periodic_clob_http_probe(discord), name="clob_http_probe"),
         asyncio.create_task(
             periodic_ops_debug(discord, ob_manager, start_time),
             name="ops_debug",
@@ -781,7 +1304,7 @@ async def main() -> None:
         shutdown_task = asyncio.create_task(shutdown_event.wait())
         done, _ = await asyncio.wait(
             [*tasks, shutdown_task],
-            return_when=asyncio.FIRST_EXCEPTION,
+            return_when=asyncio.FIRST_COMPLETED,
         )
         for t in done:
             if t != shutdown_task and t.exception():

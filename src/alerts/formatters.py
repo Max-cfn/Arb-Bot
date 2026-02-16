@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import math
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -64,6 +65,34 @@ def _format_time_left(end_date: str) -> str:
     return f"{m}m"
 
 
+def _format_plan_min_notional(opp: ArbitrageOpportunity, *, min_order_usd: float = 1.0) -> str:
+    yes_p = float(getattr(opp, "yes_best_ask", 0.0) or 0.0)
+    no_p = float(getattr(opp, "no_best_ask", 0.0) or 0.0)
+
+    # Requirement: min 5 shares each side AND min $1 notional on EACH leg
+    min_shares = 5
+    shares_yes_usd = int(math.ceil(min_order_usd / yes_p)) if yes_p > 0 else 0
+    shares_no_usd = int(math.ceil(min_order_usd / no_p)) if no_p > 0 else 0
+    shares = max(min_shares, shares_yes_usd, shares_no_usd)
+
+    yes_notional = shares * yes_p
+    no_notional = shares * no_p
+    total_cost = yes_notional + no_notional
+    est_profit = shares * float(getattr(opp, "one_share_net_profit", 0.0) or 0.0)
+
+    return (
+        f"YES ask: ${yes_p:.4f}\n"
+        f"NO ask:  ${no_p:.4f}\n"
+        f"Shares: {shares} YES + {shares} NO\n"
+        f"Notional YES: ${yes_notional:.4f}\n"
+        f"Notional NO:  ${no_notional:.4f}\n"
+        f"Total cost: ${total_cost:.4f}\n"
+        f"Net edge (per 1+1): {float(getattr(opp, 'one_share_net_edge_percent', 0.0) or 0.0):.2f}% "
+        f"(profit ${float(getattr(opp, 'one_share_net_profit', 0.0) or 0.0):.4f})\n"
+        f"Est. profit @shares: ${est_profit:.4f}"
+    )
+
+
 def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
     """Format an arbitrage opportunity as a Discord webhook payload."""
     if opp.verdict == "ACTIONABLE":
@@ -116,19 +145,19 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
                     {
                         "name": "Data freshness",
                         "value": (
-                            f"YES_age={getattr(opp, 'yes_book_age_s', 0.0):.3f}s\n"
-                            f"NO_age={getattr(opp, 'no_book_age_s', 0.0):.3f}s"
+                            f"YES_age={getattr(opp, 'yes_book_age_s', 0.0):.6f}s\n"
+                            f"NO_age={getattr(opp, 'no_book_age_s', 0.0):.6f}s"
                         ),
                         "inline": True,
                     },
                     {
-                        "name": "Plan (1 YES + 1 NO)",
-                        "value": (
-                            f"YES ask: ${opp.yes_best_ask:.4f}\n"
-                            f"NO ask: ${opp.no_best_ask:.4f}\n"
-                            f"Sum: ${opp.combined_best_asks:.4f}\n"
-                            f"Net: {opp.one_share_net_edge_percent:.2f}% (profit ${opp.one_share_net_profit:.4f})"
-                        ),
+                        "name": "Plan (min 5 shares + $1/leg)",
+                        "value": _format_plan_min_notional(opp, min_order_usd=1.0),
+                        "inline": True,
+                    },
+                    {
+                        "name": "Market rank",
+                        "value": f"#{getattr(opp, 'market_rank_idx', 0)} of {getattr(opp, 'market_total_count', 0)}",
                         "inline": True,
                     },
                     {
@@ -179,6 +208,48 @@ def format_opportunity_embed(opp: ArbitrageOpportunity) -> dict[str, Any]:
                 ],
                 "footer": {"text": f"Market ID: {str(opp.market_id)[:16]}..."},
                 "timestamp": opp.timestamp.isoformat(),
+            }
+        ],
+    }
+
+
+def format_opportunity_expired_embed(
+    opp: ArbitrageOpportunity,
+    *,
+    duration_s: float,
+    last_edge_percent: float | None = None,
+) -> dict[str, Any]:
+    """Follow-up message when an opportunity edge drops below the floor threshold."""
+    edge = float(last_edge_percent) if last_edge_percent is not None else float(getattr(opp, "net_edge_percent", 0.0) or 0.0)
+    duration_ms = duration_s * 1000.0
+    return {
+        "content": f"⏱️ **Edge dropped < 1%** (last seen {edge:.2f}%)",
+        "embeds": [
+            {
+                "title": opp.market_question[:256],
+                "url": (
+                    f"https://polymarket.com/market/{opp.slug}"
+                    if getattr(opp, "slug", "")
+                    else None
+                ),
+                "color": EMBED_COLORS["info"],
+                "fields": [
+                    {
+                        "name": "Edge lifetime",
+                        "value": f"{duration_s:.6f}s ({duration_ms:.0f}ms)",
+                        "inline": True,
+                    },
+                    {
+                        "name": "Last observed (best asks)",
+                        "value": (
+                            f"YES: ${float(getattr(opp, 'yes_best_ask', 0.0) or 0.0):.4f}\n"
+                            f"NO:  ${float(getattr(opp, 'no_best_ask', 0.0) or 0.0):.4f}"
+                        ),
+                        "inline": True,
+                    },
+                ],
+                "footer": {"text": f"Market ID: {str(opp.market_id)[:16]}..."},
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         ],
     }
