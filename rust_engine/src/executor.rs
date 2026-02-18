@@ -20,9 +20,9 @@ use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use k256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner};
 use reqwest::Client;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tokio::time::{Duration, sleep};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::cache::MetaCache;
 use crate::types::{EngineConfig, RustArbOpportunity, RustExecutionResult};
@@ -389,16 +389,103 @@ impl FastExecutor {
             };
 
             // Try to cancel the surviving order first.
-            let _ = self.cancel_orders(&[&surviving_oid]).await;
+            if let Err(ref e) = self.cancel_orders(&[&surviving_oid]).await {
+                error!(
+                    "one_leg_failed: cancel {} failed: {} — will still poll for fills run={}",
+                    surviving_oid, e, run_id
+                );
+            }
 
-            // Wait briefly, then check if it was already filled before the cancel.
+            // Wait briefly, then poll fill status with retries.
+            // FOK orders fill atomically (all-or-nothing), so surviving_filled is
+            // either 0 or `shares`.  We retry up to 4 times (50 ms apart) in case
+            // the CLOB API is transiently unavailable right after the cancel.
             sleep(Duration::from_millis(80)).await;
 
             let mut surviving_filled = 0.0f64;
             let mut surviving_final_price = 0.0f64;
-            if let Some((_st, sz, px)) = self.get_order_status(&surviving_oid).await {
-                if sz > 0.0 { surviving_filled = sz; }
-                if px > 0.0 { surviving_final_price = px; }
+            let mut status_confirmed = false;
+
+            for attempt in 0..4u8 {
+                if let Some((_st, sz, px)) = self.get_order_status(&surviving_oid).await {
+                    status_confirmed = true;
+                    if sz > surviving_filled {
+                        surviving_filled = sz;
+                    }
+                    if px > 0.0 {
+                        surviving_final_price = px;
+                    }
+                    break; // got a definitive response — stop retrying
+                }
+                if attempt < 3 {
+                    sleep(Duration::from_millis(50)).await;
+                }
+            }
+
+            // If we could not determine the fill state after all retries, perform a
+            // defensive unwind using the full order size.  FOK semantics guarantee the
+            // order is either fully filled or not at all, so selling `shares` is the
+            // correct conservative action and will be harmlessly rejected if the order
+            // was actually cancelled.
+            if !status_confirmed {
+                let (uw_token, uw_price, uw_neg_risk, uw_fee_bps, uw_tick) =
+                    if is_yes_surviving {
+                        (&opp.yes_token_id, yes_price, yes_neg_risk, yes_fee_bps, yes_tick)
+                    } else {
+                        (&opp.no_token_id, no_price, no_neg_risk, no_fee_bps, no_tick)
+                    };
+                warn!(
+                    "one_leg_failed: fill status UNKNOWN after 4 retries for {} — \
+                     defensive unwind {} shares={} run={}",
+                    surviving_oid,
+                    if is_yes_surviving { "YES" } else { "NO" },
+                    shares,
+                    run_id,
+                );
+                let unwind_ok = self
+                    .unwind_sell(
+                        uw_token,
+                        shares as f64,
+                        uw_price,
+                        uw_neg_risk,
+                        uw_fee_bps,
+                        uw_tick,
+                        config.unwind_max_loss_pct,
+                    )
+                    .await;
+                let rc = if unwind_ok {
+                    "FOK_DEFENSIVE_UNWIND_OK"
+                } else {
+                    "FOK_DEFENSIVE_UNWIND_FAILED"
+                };
+                let (yf, nf, yfp, nfp) = if is_yes_surviving {
+                    (shares as f64, 0.0, 0.0, 0.0)
+                } else {
+                    (0.0, shares as f64, 0.0, 0.0)
+                };
+                return make_terminal_result(
+                    "CANCELLED",
+                    &run_id,
+                    &opp.market_id,
+                    yes_order_id,
+                    no_order_id,
+                    format!(
+                        "{rc} one_leg_post_failed surviving={} status_unknown",
+                        if is_yes_surviving { "YES" } else { "NO" },
+                    ),
+                    rc,
+                    yf,
+                    nf,
+                    yes_price,
+                    no_price,
+                    yfp,
+                    nfp,
+                    sign_ms,
+                    submit_ms,
+                    detect_to_sign_ms,
+                    detect_to_submit_ms,
+                    t_start.elapsed().as_secs_f64() * 1000.0,
+                );
             }
 
             if surviving_filled > 0.0 {
@@ -1193,6 +1280,24 @@ impl FastExecutor {
         let timestamp = now_unix_secs();
         let hmac_sig = self.compute_hmac(&timestamp, "POST", path, &body_str)?;
 
+        // Diagnostic logging: capture signing context so any future "invalid signature"
+        // response contains enough info to distinguish key/passphrase mismatch,
+        // clock skew, or payload divergence.
+        let body_sha256 = hex::encode(&Sha256::digest(body_str.as_bytes())[..8]);
+        let hmac_prefix = &hmac_sig[..hmac_sig.len().min(12)];
+        let key_suffix = &self.api_key[self.api_key.len().saturating_sub(6)..];
+        info!(
+            "post_order: ts={} method=POST path={} body_sha256_prefix={} \
+             hmac_prefix={}… api_key_suffix=…{} passphrase_len={} signer={}",
+            timestamp,
+            path,
+            body_sha256,
+            hmac_prefix,
+            key_suffix,
+            self.api_passphrase.len(),
+            self.signer_address,
+        );
+
         let resp = self
             .http
             .post(&url)
@@ -1208,9 +1313,25 @@ impl FastExecutor {
             .context("HTTP POST failed")?;
 
         let status = resp.status();
+        // Capture x-request-id before consuming the body so errors are traceable
+        // on the CLOB side (useful when escalating to Polymarket support).
+        let x_request_id = resp
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
         let resp_text = resp.text().await.unwrap_or_default();
 
         if !status.is_success() {
+            error!(
+                "post_order ERROR: status={} x-request-id={} ts={} signer={} resp={}",
+                status,
+                x_request_id,
+                timestamp,
+                self.signer_address,
+                &resp_text[..resp_text.len().min(500)],
+            );
             return Err(anyhow!(
                 "CLOB POST returned {}: {}",
                 status,
