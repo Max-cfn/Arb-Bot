@@ -233,22 +233,41 @@ async def run_rust_hotpath(
             total_target_notional = yes_target_notional + no_target_notional
 
             # Anti-spam: throttle repetitive failure/partial events per market+status.
+            # CRITICAL reason codes bypass throttling so they are always surfaced on Discord.
             now_ts = time.time()
             throttle_window_s = float(os.getenv("EXEC_ALERT_THROTTLE_SECONDS", "15"))
             throttle_key = (mid, status)
             should_send = True
             suppressed_now = 0
 
-            if status in {"FAILED", "PARTIAL_SUBMIT", "CANCELLED"}:
+            # These reason codes indicate unknown/open positions — never throttle.
+            critical_reason_codes = {
+                "UNKNOWN_CANCEL_STATE",
+                "PARTIAL_OPEN_AFTER_CANCEL",
+                "FOK_EMERGENCY_UNWIND_FAILED",
+            }
+            is_critical = reason_code in critical_reason_codes
+
+            if status in {"FAILED", "PARTIAL_SUBMIT", "CANCELLED"} and not is_critical:
                 last_ts = exec_last_sent.get(throttle_key, 0.0)
                 if now_ts - last_ts < throttle_window_s:
                     exec_suppressed[throttle_key] = exec_suppressed.get(throttle_key, 0) + 1
                     should_send = False
+                    # Send a brief ops note so suppressed events are never completely silent.
+                    suppressed_count = exec_suppressed[throttle_key]
+                    if suppressed_count == 1:
+                        asyncio.run_coroutine_threadsafe(
+                            discord.send_ops(
+                                f"exec throttle: {suppressed_count}x {status}/{reason_code or '?'} "
+                                f"on market {mid} suppressed (window={throttle_window_s:.0f}s)"
+                            ),
+                            loop,
+                        )
                 else:
                     suppressed_now = exec_suppressed.pop(throttle_key, 0)
                     exec_last_sent[throttle_key] = now_ts
             else:
-                # For positive states, always send and reset suppression counter.
+                # Positive states and critical events: always send and reset suppression counter.
                 suppressed_now = exec_suppressed.pop(throttle_key, 0)
                 exec_last_sent[throttle_key] = now_ts
 
@@ -1138,7 +1157,15 @@ async def main() -> None:
 
                         async def _real_execute_and_report() -> None:
                             call_start_ns = time.monotonic_ns()
-                            res = await executor.execute_two_leg(opp, run_id=run_id, metrics=metrics)
+                            res = await executor.execute_two_leg(
+                                opp,
+                                run_id=run_id,
+                                metrics=metrics,
+                                # Pass discord callback so the executor can immediately
+                                # alert on PARTIAL_OPEN_AFTER_CANCEL and UNKNOWN_CANCEL_STATE
+                                # without waiting for the final result notification.
+                                discord_alert_fn=discord.send_execution,
+                            )
                             call_end_ns = time.monotonic_ns()
                             call_ms = (call_end_ns - call_start_ns) / 1e6
 
@@ -1166,7 +1193,7 @@ async def main() -> None:
 
                             # ── Build result-specific extra_fields ────────────────────────
                             final_status = res.status if res.status in {
-                                "SUBMITTED", "WAITING", "FILLED", "CANCELLED", "FAILED"
+                                "SUBMITTED", "WAITING", "FILLED", "CANCELLED", "FAILED", "PARTIAL_OPEN"
                             } else "FAILED"
 
                             if final_status == "FILLED":

@@ -17,7 +17,7 @@ class ExecutionMetrics:
 
 @dataclass
 class ExecutionResult:
-    status: Literal["SUBMITTED", "ACK", "WAITING", "PARTIAL", "FILLED", "CANCELLED", "FAILED"]
+    status: Literal["SUBMITTED", "ACK", "WAITING", "PARTIAL", "FILLED", "CANCELLED", "FAILED", "PARTIAL_OPEN"]
     run_id: str
     yes_order_id: Optional[str] = None
     no_order_id: Optional[str] = None

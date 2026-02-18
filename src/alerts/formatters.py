@@ -290,6 +290,10 @@ def format_execution_embed(
         color = EMBED_COLORS["execution_fill"]
         title_prefix = "FILLED"
         content_ping = "@here "      # always ping on fill
+    elif s_upper == "PARTIAL_OPEN":
+        color = EMBED_COLORS["execution_fail"]
+        title_prefix = "CRITICAL: Partial Open"
+        content_ping = "@here "      # always ping — cancel not confirmed by CLOB
     elif s_upper in ("FAILED", "CANCELLED", "REJECTED", "ERROR"):
         color = EMBED_COLORS["execution_fail"]
         title_prefix = "Failed / Cancelled"
@@ -359,7 +363,7 @@ def format_execution_embed(
                 "value": "**Both legs filled.** Position locked.",
                 "inline": False,
             })
-        elif s_upper in ("FAILED", "CANCELLED", "REJECTED", "ERROR"):
+        elif s_upper in ("PARTIAL_OPEN", "FAILED", "CANCELLED", "REJECTED", "ERROR"):
             fields.append({
                 "name": "Reason",
                 "value": (note[:1000] if note else "Unknown error."),

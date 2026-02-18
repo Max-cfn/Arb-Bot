@@ -157,9 +157,11 @@ class DiscordClient:
             "SUBMITTED", "PLACED", "SENDING",
             "FILLED", "SUCCESS", "COMPLETED",
             "CANCELLED", "FAILED", "REJECTED", "ERROR",
+            "PARTIAL_OPEN",  # critical: cancel not confirmed by CLOB
         }
 
-        error_statuses = {"FAILED", "CANCELLED", "REJECTED", "ERROR"}
+        # PARTIAL_OPEN is treated as an error — routes to the errors/executions channel.
+        error_statuses = {"FAILED", "CANCELLED", "REJECTED", "ERROR", "PARTIAL_OPEN"}
         target = "executions" if normalized in error_statuses else "executions_info"
 
         ok = await self._send(target, payload, priority=is_priority)

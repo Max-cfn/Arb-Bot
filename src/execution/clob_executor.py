@@ -162,7 +162,7 @@ class PolymarketClobExecutor:
         # any non-FILLED outcome is a failure per Option B
         self._consecutive_failures += 1
 
-        if result_status == "PARTIAL":
+        if result_status in {"PARTIAL", "PARTIAL_OPEN"}:
             self._partial_ts.append(now)
 
         # Trigger kill-switch if thresholds exceeded
@@ -219,7 +219,21 @@ class PolymarketClobExecutor:
             self._client = client
         return self._client
 
-    async def execute_two_leg(self, opp, run_id: str, metrics: ExecutionMetrics) -> ExecutionResult:
+    async def execute_two_leg(
+        self,
+        opp,
+        run_id: str,
+        metrics: ExecutionMetrics,
+        *,
+        discord_alert_fn=None,
+    ) -> ExecutionResult:
+        """Execute a two-leg arbitrage.
+
+        discord_alert_fn: optional async callable(opp, *, note, run_id, status)
+            Called immediately (fire-and-forget) for critical mid-execution events
+            (PARTIAL_OPEN_AFTER_CANCEL, UNKNOWN_CANCEL_STATE) that must surface
+            on Discord without waiting for the final result.
+        """
         missing = self.missing_creds()
         if missing:
             self._log_exec(
@@ -496,11 +510,14 @@ class PolymarketClobExecutor:
                 to_cancel: list[str] = []
                 if yes_oid:
                     ys = await _get_status(str(yes_oid))
-                    if ys is not None and not _is_done(ys[0]):
+                    # Belt-and-suspenders: cancel if confirmed non-terminal OR if status
+                    # is unreachable (ys is None) — a cancel on an already-closed order
+                    # is a safe no-op on the CLOB.
+                    if ys is None or not _is_done(ys[0]):
                         to_cancel.append(str(yes_oid))
                 if no_oid:
                     ns = await _get_status(str(no_oid))
-                    if ns is not None and not _is_done(ns[0]):
+                    if ns is None or not _is_done(ns[0]):
                         to_cancel.append(str(no_oid))
                 if to_cancel:
                     await asyncio.to_thread(lambda: client.cancel_orders(to_cancel))
@@ -690,19 +707,72 @@ class PolymarketClobExecutor:
                 await asyncio.sleep(self.poll_interval_s)
 
             # Phase 3: RECOVERY
-            # ── TERMINAL-STATE GUARANTEE ─────────────────────────────────────────────
-            # Before making any recovery decision we need BOTH orders to be in a
-            # provably terminal state (FILLED / CANCELLED / REJECTED / …).
-            # FOK should auto-cancel immediately, but API status can lag.
-            # Strategy:
-            #   1. Cancel any orders still showing OPEN (safety net).
-            #   2. Poll until both statuses are terminal (max 300 ms extra).
-            #      If still uncertain after timeout, treat unknown = CANCELLED.
+            # ── CANCEL OPEN ORDERS ────────────────────────────────────────────────────
+            # Cancel any orders still OPEN (or status-unreachable as belt-and-suspenders).
             to_cancel = await _cancel_open()
 
+            # ── EXPLICIT CANCEL VERIFICATION ─────────────────────────────────────────
+            # After cancel_orders(), confirm each order is actually terminal via GET
+            # with retries.  FOK orders auto-cancel on the CLOB but status propagation
+            # can lag by hundreds of ms.  We NEVER assume CANCELLED until we see it.
+            async def _verify_cancel_confirmed(oid: str | None, max_retries: int = 4) -> tuple[str, dict]:
+                """GET order with retries until terminal. Returns (status, od) or ('UNKNOWN', {})."""
+                if not oid:
+                    return "UNKNOWN", {}
+                for _ in range(max_retries):
+                    st = await _get_status(str(oid))
+                    if st is not None:
+                        status_str, od = st
+                        if _is_done(status_str):
+                            return status_str, od
+                    await asyncio.sleep(0.05)  # 50 ms retry
+                # Final attempt after all retries
+                final = await _get_status(str(oid))
+                if final is not None:
+                    return final[0], final[1]
+                return "UNKNOWN", {}
+
+            yes_cancel_status, yes_cancel_od = await _verify_cancel_confirmed(str(yes_oid) if yes_oid else None)
+            no_cancel_status, no_cancel_od = await _verify_cancel_confirmed(str(no_oid) if no_oid else None)
+
+            self._log_exec(
+                "cancel_verify",
+                run_id=run_id,
+                yes_oid=_redact(str(yes_oid) if yes_oid else ""),
+                no_oid=_redact(str(no_oid) if no_oid else ""),
+                yes_cancel_status=yes_cancel_status,
+                no_cancel_status=no_cancel_status,
+                cancelled_open=len(to_cancel),
+            )
+
+            # ── TERMINAL-STATE GUARANTEE ─────────────────────────────────────────────
+            # Seed terminal flags from cancel verification results, then continue polling.
+            # CRITICAL: when API is unreachable (None response) we do NOT set
+            # yes_terminal/no_terminal = True — that was the previous bug.
+            # Instead we track yes_unreachable/no_unreachable and handle below.
             terminal_deadline = time.monotonic() + 0.3  # 300 ms hard cap
             yes_terminal = yes_filled  # already confirmed above if True
             no_terminal = no_filled
+            yes_unreachable = False
+            no_unreachable = False
+
+            # Incorporate cancel-verify results
+            if not yes_terminal:
+                if yes_cancel_status != "UNKNOWN":
+                    yes_size_filled = max(yes_size_filled, _filled_size(yes_cancel_od))
+                    yes_filled = yes_filled or (yes_cancel_status == "FILLED")
+                    yes_terminal = _is_done(yes_cancel_status)
+                else:
+                    yes_unreachable = True
+
+            if not no_terminal:
+                if no_cancel_status != "UNKNOWN":
+                    no_size_filled = max(no_size_filled, _filled_size(no_cancel_od))
+                    no_filled = no_filled or (no_cancel_status == "FILLED")
+                    no_terminal = _is_done(no_cancel_status)
+                else:
+                    no_unreachable = True
+
             while time.monotonic() < terminal_deadline and not (yes_terminal and no_terminal):
                 yt, nt = await asyncio.gather(
                     _get_status(str(yes_oid)),
@@ -713,15 +783,19 @@ class PolymarketClobExecutor:
                     yes_size_filled = max(yes_size_filled, _filled_size(last_yes))
                     yes_filled = yes_filled or (yst2 == "FILLED")
                     yes_terminal = _is_done(yst2)
+                    yes_unreachable = False
                 else:
-                    yes_terminal = True  # treat unreachable as terminal (conservative)
+                    # API unreachable — do NOT assume terminal
+                    yes_unreachable = True
+
                 if nt is not None:
                     nst2, last_no = nt
                     no_size_filled = max(no_size_filled, _filled_size(last_no))
                     no_filled = no_filled or (nst2 == "FILLED")
                     no_terminal = _is_done(nst2)
+                    no_unreachable = False
                 else:
-                    no_terminal = True
+                    no_unreachable = True
 
                 if yes_terminal and no_terminal:
                     break
@@ -739,8 +813,109 @@ class PolymarketClobExecutor:
                 no_size_filled=round(float(no_size_filled), 6),
                 yes_terminal=yes_terminal,
                 no_terminal=no_terminal,
+                yes_unreachable=yes_unreachable,
+                no_unreachable=no_unreachable,
+                yes_cancel_status=yes_cancel_status,
+                no_cancel_status=no_cancel_status,
                 cancelled_open=len(to_cancel),
             )
+
+            # ── UNKNOWN_CANCEL_STATE ──────────────────────────────────────────────────
+            # CLOB API consistently unreachable: cannot confirm whether orders are
+            # cancelled.  We may have an open position we can't see.
+            # Action: emergency-sell any known filled leg, then raise CRITICAL alert.
+            if (yes_unreachable or no_unreachable) and not (yes_filled and no_filled):
+                unwind_detail = ""
+                if yes_size_filled > 0 and not no_filled:
+                    uw_ok, uw_info = await _unwind_sell(str(opp.yes_token_id), yes_size_filled, yes_limit, emergency=True)
+                    unwind_detail = f" EMERGENCY_UNWIND_YES ok={uw_ok}"
+                    self._log_exec("emergency_unwind", run_id=run_id, ok=uw_ok, info=uw_info, trigger="unknown_cancel_state")
+                elif no_size_filled > 0 and not yes_filled:
+                    uw_ok, uw_info = await _unwind_sell(str(opp.no_token_id), no_size_filled, no_limit, emergency=True)
+                    unwind_detail = f" EMERGENCY_UNWIND_NO ok={uw_ok}"
+                    self._log_exec("emergency_unwind", run_id=run_id, ok=uw_ok, info=uw_info, trigger="unknown_cancel_state")
+
+                unk_reason = (
+                    f"UNKNOWN_CANCEL_STATE: CLOB unreachable during cancel verification — "
+                    f"cannot confirm order cancellation. "
+                    f"yes_unreachable={yes_unreachable} no_unreachable={no_unreachable} "
+                    f"yes_cancel_status={yes_cancel_status} no_cancel_status={no_cancel_status} "
+                    f"yes_size={yes_size_filled:.4f} no_size={no_size_filled:.4f}"
+                    f"{unwind_detail}"
+                )
+                logger.error("EXEC_UNKNOWN_CANCEL run=%s %s", run_id, unk_reason)
+
+                if discord_alert_fn is not None:
+                    asyncio.create_task(discord_alert_fn(
+                        opp,
+                        note=f"CRITICAL: {unk_reason}",
+                        run_id=run_id,
+                        status="FAILED",
+                    ))
+
+                res = ExecutionResult(
+                    status="FAILED",
+                    run_id=run_id,
+                    yes_order_id=str(yes_oid) if yes_oid else None,
+                    no_order_id=str(no_oid) if no_oid else None,
+                    reason=unk_reason,
+                    reason_code="UNKNOWN_CANCEL_STATE",
+                    yes_filled_size=float(yes_size_filled),
+                    no_filled_size=float(no_size_filled),
+                    metrics=metrics,
+                )
+                self._log_exec("result", run_id=run_id, status=res.status, reason=res.reason[:800], phase="unknown_cancel_state")
+                self._note_outcome(res.status)
+                return res
+
+            # ── PARTIAL_OPEN_AFTER_CANCEL ─────────────────────────────────────────────
+            # Cancel was sent but CLOB still reports a non-terminal status (confirmed
+            # reachable, not UNKNOWN).  The order is still live on the book.
+            # Action: emergency-sell any filled shares, then raise CRITICAL alert.
+            po_yes = not yes_terminal and not yes_unreachable
+            po_no = not no_terminal and not no_unreachable
+            if po_yes or po_no:
+                po_notes: list[str] = []
+                if po_yes:
+                    if yes_size_filled > 0:
+                        uw_ok, uw_info = await _unwind_sell(str(opp.yes_token_id), yes_size_filled, yes_limit, emergency=True)
+                        po_notes.append(f"YES PARTIAL_OPEN filled={yes_size_filled:.4f} unwind_ok={uw_ok}")
+                        self._log_exec("emergency_unwind", run_id=run_id, ok=uw_ok, info=uw_info, trigger="partial_open_after_cancel_yes")
+                    else:
+                        po_notes.append("YES PARTIAL_OPEN no fills — order still live on CLOB, manual check needed")
+                if po_no:
+                    if no_size_filled > 0:
+                        uw_ok, uw_info = await _unwind_sell(str(opp.no_token_id), no_size_filled, no_limit, emergency=True)
+                        po_notes.append(f"NO PARTIAL_OPEN filled={no_size_filled:.4f} unwind_ok={uw_ok}")
+                        self._log_exec("emergency_unwind", run_id=run_id, ok=uw_ok, info=uw_info, trigger="partial_open_after_cancel_no")
+                    else:
+                        po_notes.append("NO PARTIAL_OPEN no fills — order still live on CLOB, manual check needed")
+
+                po_reason = "PARTIAL_OPEN_AFTER_CANCEL: " + "; ".join(po_notes)
+                logger.error("EXEC_PARTIAL_OPEN run=%s %s", run_id, po_reason)
+
+                if discord_alert_fn is not None:
+                    asyncio.create_task(discord_alert_fn(
+                        opp,
+                        note=f"CRITICAL: {po_reason}",
+                        run_id=run_id,
+                        status="PARTIAL_OPEN",
+                    ))
+
+                res = ExecutionResult(
+                    status="PARTIAL_OPEN",
+                    run_id=run_id,
+                    yes_order_id=str(yes_oid) if yes_oid else None,
+                    no_order_id=str(no_oid) if no_oid else None,
+                    reason=po_reason,
+                    reason_code="PARTIAL_OPEN_AFTER_CANCEL",
+                    yes_filled_size=float(yes_size_filled),
+                    no_filled_size=float(no_size_filled),
+                    metrics=metrics,
+                )
+                self._log_exec("result", run_id=run_id, status=res.status, reason=res.reason[:800], phase="partial_open_after_cancel")
+                self._note_outcome(res.status)
+                return res
 
             # Case A: both legs filled >0 (hedged, possibly smaller)
             if yes_size_filled > 0 and no_size_filled > 0:
