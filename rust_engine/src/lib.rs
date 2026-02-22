@@ -13,7 +13,7 @@ pub mod ws_client;
 use std::collections::VecDeque;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Instant;
 
@@ -190,6 +190,14 @@ impl HotPathEngine {
 
                 info!("lib: main event loop started");
 
+                // Detection stats
+                let cnt_ws = Arc::new(AtomicU64::new(0));
+                let cnt_stale = Arc::new(AtomicU64::new(0));
+                let cnt_no_liq = Arc::new(AtomicU64::new(0));
+                let cnt_opp = Arc::new(AtomicU64::new(0));
+                let stats_t0 = Instant::now();
+                let mut last_stats_s: u64 = 0;
+
                 // Main event loop — process WS events
                 while let Some(event) = event_rx.recv().await {
                     match event {
@@ -209,6 +217,24 @@ impl HotPathEngine {
                             // Compute book ages
                             let yes_age = yes_book.last_update.elapsed().as_secs_f64();
                             let no_age = no_book.last_update.elapsed().as_secs_f64();
+                            let _ws_total = cnt_ws.fetch_add(1, Ordering::Relaxed) + 1;
+                            // periodic stats + stale gate
+                            {
+                                let es = stats_t0.elapsed().as_secs();
+                                if es > last_stats_s && es % 60 == 0 {
+                                    last_stats_s = es;
+                                    info!("STATS t={}s ws={} stale={} opp={}",
+                                        es, _ws_total,
+                                        cnt_stale.load(Ordering::Relaxed),
+                                        cnt_opp.load(Ordering::Relaxed));
+                                }
+                            }
+                            let _mxage = if market.is_crypto_15min { 2.0 } else { 8.0 };
+                            if yes_age > _mxage || no_age > _mxage {
+                                cnt_stale.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+
 
                             // Run detection
                             let opp = detect_binary_arb(
@@ -228,6 +254,7 @@ impl HotPathEngine {
                             );
 
                             if let Some(opportunity) = opp {
+                                cnt_opp.fetch_add(1, Ordering::Relaxed);
                                 // Call Python on_opportunity callback
                                 let cb_opp = opportunity.clone();
                                 Python::with_gil(|py| {

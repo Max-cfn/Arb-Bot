@@ -229,6 +229,11 @@ impl FastExecutor {
         let exec_edge_pct = estimate_net_edge_percent(yes_price, no_price, yes_fee_bps, no_fee_bps);
         let edge_decay_bps = ((detect_edge_pct - exec_edge_pct) * 100.0).max(0.0);
 
+        // PRE-ATTEMPT LOG
+        let _braw=self.balance_usdc.load(std::sync::atomic::Ordering::Relaxed);
+        let _bstr=if _braw==u64::MAX{"NOT_FETCHED".to_string()}else{format!("${:.4}",_braw as f64/1_000_000.0)};
+        info!("pre_attempt run={} mkt={} bal={} yes_ask={:.4} no_ask={:.4} edge={:.3}%",
+            run_id,opp.market_id,_bstr,opp.yes_best_ask,opp.no_best_ask,detect_edge_pct);
         // -----------------------------------------------------------------
         // Balance guard — free atomic read, zero network cost on hot path.
         // sum_target_usd = shares * (yes_price + no_price) in micro-USDC.
@@ -346,6 +351,12 @@ impl FastExecutor {
         let detect_to_submit_ms = delta_ms_from_unix_ns(opp.t_detect_ns)
             .unwrap_or(detect_to_sign_ms + sign_ms + submit_ms);
 
+        // ATTEMPT TRACE
+        let yj=yes_resp.as_ref().ok().and_then(extract_order_id);
+        let nj=no_resp.as_ref().ok().and_then(extract_order_id);
+        let ye=yes_resp.as_ref().err().map(|e|e.to_string()).unwrap_or_default();
+        let ne=no_resp.as_ref().err().map(|e|e.to_string()).unwrap_or_default();
+        info!("attempt_trace run={} mkt={} shares={} sm={:.1}ms YES_ok={} YES_oid={} YES_err={} NO_ok={} NO_oid={} NO_err={}",run_id,opp.market_id,shares,submit_ms,yes_resp.is_ok(),yj.as_deref().unwrap_or("-"),&ye[..ye.len().min(80)],no_resp.is_ok(),nj.as_deref().unwrap_or("-"),&ne[..ne.len().min(80)]);
         let yes_order_id = yes_resp.as_ref().ok().and_then(extract_order_id);
         let no_order_id = no_resp.as_ref().ok().and_then(extract_order_id);
 
@@ -691,6 +702,8 @@ impl FastExecutor {
             sleep(poll_interval).await;
         }
 
+        info!("poll_result run={} YES_state={} YES_filled={:.4} YES_term={} NO_state={} NO_filled={:.4} NO_term={}",
+            run_id,yes_state,yes_filled,yes_terminal,no_state,no_filled,no_terminal);
         let yes_full = yes_filled + 0.000001 >= shares as f64 && yes_terminal;
         let no_full = no_filled + 0.000001 >= shares as f64 && no_terminal;
 
@@ -1339,7 +1352,13 @@ impl FastExecutor {
             ));
         }
 
-        serde_json::from_str(&resp_text).context("Failed to parse CLOB response JSON")
+        let parsed: serde_json::Value = serde_json::from_str(&resp_text)
+            .context("Failed to parse CLOB response JSON")?;
+        let oid = parsed.get("orderID").or_else(|| parsed.get("id"))
+            .and_then(|v| v.as_str()).unwrap_or("-");
+        info!("post_order OK: status={} xrid={} ts={} order_id={} body={}",
+            status, x_request_id, timestamp, oid, &resp_text[..resp_text.len().min(300)]);
+        Ok(parsed)
     }
 
     /// GET /data/order/{id} — fetch order status + filled size.

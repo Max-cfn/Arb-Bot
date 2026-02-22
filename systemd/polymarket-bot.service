@@ -7,13 +7,13 @@ Wants=network-online.target
 Type=simple
 User=ubuntu
 Group=ubuntu
-WorkingDirectory=/home/ubuntu/polymarket-arb-bot
-ExecStart=/home/ubuntu/polymarket-arb-bot/venv/bin/python -m src.main
+WorkingDirectory=/opt/polymarket-bot/Arb-Bot
+ExecStart=/opt/polymarket-bot/Arb-Bot/venv/bin/python -m src.main
 Restart=always
 RestartSec=10
 
 # Environment
-EnvironmentFile=/home/ubuntu/polymarket-arb-bot/.env
+EnvironmentFile=/opt/polymarket-bot/Arb-Bot/.env
 
 # Logging
 StandardOutput=journal
@@ -23,7 +23,7 @@ SyslogIdentifier=polymarket-bot
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/home/ubuntu/polymarket-arb-bot/data /home/ubuntu/polymarket-arb-bot/logs
+ReadWritePaths=/opt/polymarket-bot/Arb-Bot/data /opt/polymarket-bot/Arb-Bot/logs
 
 [Install]
 WantedBy=multi-user.target
