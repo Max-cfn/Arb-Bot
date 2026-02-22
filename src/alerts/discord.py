@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import os
 from typing import Any
 
 import aiohttp
@@ -19,35 +21,77 @@ from src.config import Config
 from src.detector.base import ArbitrageOpportunity
 from src.utils.logger import logger
 
-# Discord allows ~30 req/min per webhook = 2s between sends for sustained traffic.
-# Priority messages (FILLED, SUBMITTED, CANCELLED, …) skip this pacing, but we still
-# enforce a 1s minimum gap to avoid back-to-back 429s when SUBMITTED+FILLED arrive
-# within milliseconds of each other.
-RATE_LIMIT_DELAY = 2.0          # seconds between sends — non-priority messages
-PRIORITY_MIN_GAP  = 1.0         # minimum seconds between sends — priority messages
+# Discord allows ~30 req/min per webhook.
+# Tunable via env for live tuning without code changes:
+# - DISCORD_RATE_LIMIT_DELAY (default 2.0)
+# - DISCORD_PRIORITY_MIN_GAP (default 1.0)
+# - DISCORD_DEDUP_WINDOW_SECONDS (default 12)
+# - DISCORD_DEDUP_CACHE_SIZE (default 300)
+RATE_LIMIT_DELAY = float(os.getenv("DISCORD_RATE_LIMIT_DELAY", "2.0"))
+PRIORITY_MIN_GAP = float(os.getenv("DISCORD_PRIORITY_MIN_GAP", "1.0"))
+DEDUP_WINDOW_S = float(os.getenv("DISCORD_DEDUP_WINDOW_SECONDS", "12"))
+DEDUP_CACHE_SIZE = int(os.getenv("DISCORD_DEDUP_CACHE_SIZE", "300"))
 
 
 class DiscordClient:
     """Sends alerts to Discord via webhooks."""
 
     def __init__(self, config: Config):
+        # Support webhook sharding (comma-separated URLs) to spread bursts and reduce 429s.
         self._webhooks = {
-            "health": config.discord_webhook_health,
-            "ops": config.discord_webhook_ops,
-            "daily": config.discord_webhook_daily,
-            "opportunities": config.discord_webhook_opportunities,
-            "executions": config.discord_webhook_executions,  # errors
-            "executions_info": config.discord_webhook_executions_info,
+            "health": self._parse_webhook_urls(config.discord_webhook_health),
+            "ops": self._parse_webhook_urls(config.discord_webhook_ops),
+            "daily": self._parse_webhook_urls(config.discord_webhook_daily),
+            "opportunities": self._parse_webhook_urls(config.discord_webhook_opportunities),
+            "executions": self._parse_webhook_urls(config.discord_webhook_executions),  # errors
+            "executions_info": self._parse_webhook_urls(config.discord_webhook_executions_info),
         }
-        self._last_send_by_webhook: dict[str, float] = {}
-        # Per-webhook lock: serializes concurrent sends to the same webhook so we
-        # never fire two requests simultaneously and trigger Discord rate-limiting.
+        self._last_send_by_url: dict[str, float] = {}
+        # Per-url lock: serializes concurrent sends to a specific webhook URL.
         self._locks: dict[str, asyncio.Lock] = {}
+        # Lightweight dedup for noisy repeated payloads.
+        self._recent_hashes: dict[str, float] = {}
 
-    def _lock(self, webhook_key: str) -> asyncio.Lock:
-        if webhook_key not in self._locks:
-            self._locks[webhook_key] = asyncio.Lock()
-        return self._locks[webhook_key]
+    def _parse_webhook_urls(self, raw: str) -> list[str]:
+        return [u.strip() for u in (raw or "").split(",") if u.strip()]
+
+    def _pick_webhook_url(self, webhook_key: str) -> str:
+        urls = self._webhooks.get(webhook_key, [])
+        if not urls:
+            return ""
+        # Least recently used URL first.
+        return min(urls, key=lambda u: self._last_send_by_url.get(u, 0.0))
+
+    def _lock(self, webhook_url: str) -> asyncio.Lock:
+        if webhook_url not in self._locks:
+            self._locks[webhook_url] = asyncio.Lock()
+        return self._locks[webhook_url]
+
+    def _dedup_key(self, webhook_key: str, payload: dict[str, Any]) -> str:
+        try:
+            import json
+            body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        except Exception:
+            body = str(payload)
+        h = hashlib.sha1(body.encode("utf-8")).hexdigest()
+        return f"{webhook_key}:{h}"
+
+    def _should_skip_duplicate(self, webhook_key: str, payload: dict[str, Any], *, priority: bool) -> bool:
+        # Never dedup financially critical status messages.
+        if priority:
+            return False
+        now = asyncio.get_event_loop().time()
+        k = self._dedup_key(webhook_key, payload)
+        ts = self._recent_hashes.get(k)
+        if ts is not None and (now - ts) < DEDUP_WINDOW_S:
+            return True
+        self._recent_hashes[k] = now
+        # Trim cache.
+        if len(self._recent_hashes) > DEDUP_CACHE_SIZE:
+            oldest = sorted(self._recent_hashes.items(), key=lambda kv: kv[1])[: max(1, DEDUP_CACHE_SIZE // 10)]
+            for ok, _ in oldest:
+                self._recent_hashes.pop(ok, None)
+        return False
 
     async def _send(
         self,
@@ -65,15 +109,19 @@ class DiscordClient:
         - 429 handling: respects retry_after from Discord, then retries with same
           priority flag (so no accidental 2 s re-pacing on a critical message).
         """
-        url = self._webhooks.get(webhook_key, "")
+        if self._should_skip_duplicate(webhook_key, payload, priority=priority):
+            logger.debug("Dedup skipped Discord payload on %s", webhook_key)
+            return True
+
+        url = self._pick_webhook_url(webhook_key)
         if not url:
             logger.debug("No webhook configured for %s, skipping", webhook_key)
             return False
 
-        async with self._lock(webhook_key):
+        async with self._lock(url):
             try:
                 now = asyncio.get_event_loop().time()
-                last = self._last_send_by_webhook.get(webhook_key, 0.0)
+                last = self._last_send_by_url.get(url, 0.0)
                 elapsed = now - last
                 min_gap = PRIORITY_MIN_GAP if priority else RATE_LIMIT_DELAY
                 if elapsed < min_gap:
@@ -85,7 +133,7 @@ class DiscordClient:
                         json=payload,
                         timeout=aiohttp.ClientTimeout(total=10),
                     ) as resp:
-                        self._last_send_by_webhook[webhook_key] = asyncio.get_event_loop().time()
+                        self._last_send_by_url[url] = asyncio.get_event_loop().time()
                         if resp.status == 204:
                             return True
                         if resp.status == 429:

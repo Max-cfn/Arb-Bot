@@ -274,10 +274,17 @@ async def run_rust_hotpath(
             if not should_send:
                 return
 
+            yes_order_id = str(getattr(res, "yes_order_id", "") or "")
+            no_order_id = str(getattr(res, "no_order_id", "") or "")
+            yes_filled_size = float(getattr(res, "yes_filled_size", 0.0) or 0.0)
+            no_filled_size = float(getattr(res, "no_filled_size", 0.0) or 0.0)
+
             note = (
                 f"rust_exec status={status}"
                 f"{(' | reason_code=' + reason_code) if reason_code else ''}\n"
                 f"reason_detail={reason}\n"
+                f"orders: YES_id={(yes_order_id[:24] + '…') if yes_order_id else '-'} | NO_id={(no_order_id[:24] + '…') if no_order_id else '-'}\n"
+                f"fills: YES={yes_filled_size:.5f} | NO={no_filled_size:.5f}\n"
                 f"durations_ms: detect_to_sign={float(getattr(res, 'detect_to_sign_ms', 0.0) or 0.0):.5f} | "
                 f"detect_to_submit={float(getattr(res, 'detect_to_submit_ms', 0.0) or 0.0):.5f} | "
                 f"sign={float(getattr(res, 'sign_ms', 0.0) or 0.0):.5f} | "
