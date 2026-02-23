@@ -462,6 +462,7 @@ impl FastExecutor {
                         uw_fee_bps,
                         uw_tick,
                         config.unwind_max_loss_pct,
+                        config.unwind_min_price_floor,
                     )
                     .await;
                 let rc = if unwind_ok {
@@ -585,6 +586,7 @@ impl FastExecutor {
                         unwind_fee_bps,
                         unwind_tick,
                         config.unwind_max_loss_pct,
+                        config.unwind_min_price_floor,
                     )
                     .await;
 
@@ -854,6 +856,7 @@ impl FastExecutor {
                     yes_fee_bps,
                     yes_tick,
                     config.unwind_max_loss_pct,
+                    config.unwind_min_price_floor,
                 )
                 .await;
             let rc = if unwind_ok {
@@ -940,6 +943,7 @@ impl FastExecutor {
                     no_fee_bps,
                     no_tick,
                     config.unwind_max_loss_pct,
+                    config.unwind_min_price_floor,
                 )
                 .await;
             let rc = if unwind_ok {
@@ -1055,12 +1059,15 @@ impl FastExecutor {
 
     /// Sell shares to unwind a one-sided position using FAK.
     ///
-    /// Two-attempt strategy:
-    ///   Attempt 1 — floor = buy_price × (1 − max_loss_pct/100), poll 600 ms.
-    ///               Fills at the best available bid as long as it's above floor.
-    ///   Attempt 2 — floor = $0.02 ("nuke price"), poll 600 ms.
-    ///               Virtually guaranteed to fill regardless of market move.
-    ///               Accepts large loss to guarantee position closure.
+    /// Three-attempt strategy with decreasing floor — never goes below `min_price_floor`:
+    ///   Attempt 1 — floor = max(buy_price × (1 − max_loss_pct/100),   min_price_floor), poll 600 ms.
+    ///   Attempt 2 — floor = max(buy_price × (1 − (max_loss_pct+2)/100), min_price_floor), poll 600 ms.
+    ///               200 ms pause before this attempt.
+    ///   Attempt 3 — floor = max(buy_price × (1 − (max_loss_pct+5)/100), min_price_floor), poll 600 ms.
+    ///               500 ms pause before this attempt.
+    ///
+    /// Each attempt fills at the best available bid as long as it's above the floor.
+    /// If all three fail the position remains open and the caller reports UNWIND_FAILED.
     ///
     /// Returns true only when a fill is confirmed (filled_size > 0 in terminal state).
     async fn unwind_sell(
@@ -1072,13 +1079,14 @@ impl FastExecutor {
         fee_rate_bps: u32,
         tick_size: &str,
         max_loss_pct: f64,
+        min_price_floor: f64,
     ) -> bool {
         if shares <= 0.0 {
             return false;
         }
 
-        // Attempt 1: sell at conservative floor (buy_price × (1 − max_loss_pct%))
-        let floor1 = (buy_price * (1.0 - max_loss_pct / 100.0)).max(0.01);
+        // Attempt 1: conservative floor (configured max loss %)
+        let floor1 = (buy_price * (1.0 - max_loss_pct / 100.0)).max(min_price_floor);
         if self
             .try_unwind_once(token_id, shares, floor1, neg_risk, fee_rate_bps, tick_size)
             .await
@@ -1086,25 +1094,28 @@ impl FastExecutor {
             return true;
         }
 
-        // Attempt 2: nuke price — accept any fill, guaranteed exit
+        // Attempt 2: widen floor by +2 percentage points, pause 200 ms first
+        sleep(Duration::from_millis(200)).await;
+        let floor2 = (buy_price * (1.0 - (max_loss_pct + 2.0) / 100.0)).max(min_price_floor);
         error!(
-            "unwind attempt 1 failed (floor={:.4}), retrying at nuke price (floor=0.02) token={}",
-            floor1, token_id
+            "unwind attempt 1 failed (floor={:.4}), retrying with wider floor={:.4} token={}",
+            floor1, floor2, token_id
         );
         if self
-            .try_unwind_once(token_id, shares, 0.02, neg_risk, fee_rate_bps, tick_size)
+            .try_unwind_once(token_id, shares, floor2, neg_risk, fee_rate_bps, tick_size)
             .await
         {
             return true;
         }
 
-        // Attempt 3: final nuke retry after a pause — handles transient exchange unavailability.
+        // Attempt 3: widen floor by +5 percentage points, pause 500 ms first
         sleep(Duration::from_millis(500)).await;
+        let floor3 = (buy_price * (1.0 - (max_loss_pct + 5.0) / 100.0)).max(min_price_floor);
         error!(
-            "unwind attempt 2 failed, final nuke price attempt (floor=0.02) token={}",
-            token_id
+            "unwind attempt 2 failed (floor={:.4}), final attempt floor={:.4} token={}",
+            floor2, floor3, token_id
         );
-        self.try_unwind_once(token_id, shares, 0.02, neg_risk, fee_rate_bps, tick_size)
+        self.try_unwind_once(token_id, shares, floor3, neg_risk, fee_rate_bps, tick_size)
             .await
     }
 
