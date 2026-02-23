@@ -1091,12 +1091,28 @@ impl FastExecutor {
             "unwind attempt 1 failed (floor={:.4}), retrying at nuke price (floor=0.02) token={}",
             floor1, token_id
         );
+        if self
+            .try_unwind_once(token_id, shares, 0.02, neg_risk, fee_rate_bps, tick_size)
+            .await
+        {
+            return true;
+        }
+
+        // Attempt 3: final nuke retry after a pause — handles transient exchange unavailability.
+        sleep(Duration::from_millis(500)).await;
+        error!(
+            "unwind attempt 2 failed, final nuke price attempt (floor=0.02) token={}",
+            token_id
+        );
         self.try_unwind_once(token_id, shares, 0.02, neg_risk, fee_rate_bps, tick_size)
             .await
     }
 
     /// Submit one FAK sell and poll up to 600 ms for a confirmed fill.
     /// Returns true only if filled_size > 0 in a terminal state.
+    ///
+    /// Retries sign+POST up to 3 times (100 ms / 200 ms backoff) to handle
+    /// transient network errors or temporary exchange availability issues.
     async fn try_unwind_once(
         &self,
         token_id: &str,
@@ -1107,32 +1123,45 @@ impl FastExecutor {
         tick_size: &str,
     ) -> bool {
         let sell_price = round_to_tick(floor_price, tick_size);
-        let order = self.build_order(token_id, sell_price, shares, fee_rate_bps, SELL);
-        let sig = match self.sign_order(&order, neg_risk) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("unwind sign failed: {}", e);
-                return false;
+
+        // Retry sign+POST up to 3 times with backoff (handles transient errors).
+        let mut oid: Option<String> = None;
+        for post_attempt in 0..3u8 {
+            if post_attempt > 0 {
+                sleep(Duration::from_millis(100 * post_attempt as u64)).await;
             }
-        };
-        let body = self.build_post_body(&order, &sig, "FAK");
-        let oid = match self.post_order(&body).await {
-            Ok(v) => {
-                let id = extract_order_id(&v);
-                info!(
-                    "unwind sell submitted: oid={:?} floor={:.4} shares={:.4}",
-                    id, floor_price, shares
-                );
-                match id {
-                    Some(s) => s,
-                    None => {
-                        error!("unwind sell: no orderID in response");
-                        return false;
+            let order = self.build_order(token_id, sell_price, shares, fee_rate_bps, SELL);
+            let sig = match self.sign_order(&order, neg_risk) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("unwind sign failed attempt={}: {}", post_attempt + 1, e);
+                    return false; // sign failure is structural, not transient
+                }
+            };
+            let body = self.build_post_body(&order, &sig, "FAK");
+            match self.post_order(&body).await {
+                Ok(v) => {
+                    let id = extract_order_id(&v);
+                    info!(
+                        "unwind sell submitted: oid={:?} floor={:.4} shares={:.4} post_attempt={}",
+                        id, floor_price, shares, post_attempt + 1,
+                    );
+                    if let Some(s) = id {
+                        oid = Some(s);
+                        break;
                     }
+                    error!("unwind sell: no orderID in response attempt={}", post_attempt + 1);
+                }
+                Err(e) => {
+                    error!("unwind sell POST failed attempt={}: {}", post_attempt + 1, e);
                 }
             }
-            Err(e) => {
-                error!("unwind sell POST failed: {}", e);
+        }
+
+        let oid = match oid {
+            Some(s) => s,
+            None => {
+                error!("unwind sell: all POST attempts failed floor={:.4} token={}", floor_price, token_id);
                 return false;
             }
         };

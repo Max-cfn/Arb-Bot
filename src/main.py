@@ -245,6 +245,7 @@ async def run_rust_hotpath(
                 "UNKNOWN_CANCEL_STATE",
                 "PARTIAL_OPEN_AFTER_CANCEL",
                 "FOK_EMERGENCY_UNWIND_FAILED",
+                "FOK_DEFENSIVE_UNWIND_FAILED",
             }
             is_critical = reason_code in critical_reason_codes
 
@@ -298,12 +299,39 @@ async def run_rust_hotpath(
             if suppressed_now > 0:
                 note += f"\n(throttle) {suppressed_now} events similaires supprimés dans les {throttle_window_s:.0f}s"
 
+            # For unwind failures the Rust executor returns status=CANCELLED but the position
+            # may still be open (one leg filled, unwind failed).  Override the Discord status
+            # to PARTIAL_OPEN so the embed gets an @here ping and routes to the error channel.
+            discord_status = status
+            unwind_failed_codes = {"FOK_EMERGENCY_UNWIND_FAILED", "FOK_DEFENSIVE_UNWIND_FAILED"}
+            if reason_code in unwind_failed_codes:
+                open_leg = "YES" if yes_filled_size > 0 else "NO"
+                open_shares = yes_filled_size if yes_filled_size > 0 else no_filled_size
+                is_confirmed = reason_code == "FOK_EMERGENCY_UNWIND_FAILED"
+                certainty = "CONFIRMÉE" if is_confirmed else "POSSIBLE (statut inconnu)"
+                urgent_prefix = (
+                    f"URGENT — Position ouverte {certainty} : jambe {open_leg} "
+                    f"({open_shares:.4f} shares) remplie mais l'unwind a ÉCHOUÉ. "
+                    f"Vérifier le portefeuille et fermer manuellement si nécessaire.\n\n"
+                )
+                note = urgent_prefix + note
+                discord_status = "PARTIAL_OPEN"
+                # Secondary ops alert as backup channel in case executions webhook is down.
+                asyncio.run_coroutine_threadsafe(
+                    discord.send_ops(
+                        f"URGENT {reason_code} — jambe {open_leg} {open_shares:.4f} shares "
+                        f"ouverte sur marché {mid} | run={str(getattr(res, 'run_id', ''))} | "
+                        f"Unwind échoué — intervention manuelle requise!"
+                    ),
+                    loop,
+                )
+
             asyncio.run_coroutine_threadsafe(
                 discord.send_execution(
                     opp,
                     note=note,
                     run_id=str(getattr(res, "run_id", "")),
-                    status=status,
+                    status=discord_status,
                 ),
                 loop,
             )
