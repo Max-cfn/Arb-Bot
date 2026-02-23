@@ -1228,9 +1228,33 @@ async def main() -> None:
                             est_edge_pct = (est_profit_usd / actual_cost * 100) if actual_cost > 0 else 0.0
 
                             # ── Build result-specific extra_fields ────────────────────────
+                            reason_code_res = str(getattr(res, "reason_code", "") or "")
                             final_status = res.status if res.status in {
                                 "SUBMITTED", "WAITING", "FILLED", "CANCELLED", "FAILED", "PARTIAL_OPEN"
                             } else "FAILED"
+
+                            # ── Unwind overrides (mirror Rust on_execution callback) ───────
+                            # FOK_EMERGENCY_UNWIND_FAILED: one leg filled, unwind failed →
+                            #   position is OPEN. Escalate to PARTIAL_OPEN (@here + ops backup).
+                            # FOK_EMERGENCY_UNWIND_OK: one leg filled, unwind succeeded →
+                            #   position closed at a loss. Use dedicated UNWIND_OK status.
+                            _unwind_failed_codes = {"FOK_EMERGENCY_UNWIND_FAILED", "FOK_DEFENSIVE_UNWIND_FAILED"}
+                            _unwind_ok_codes = {"FOK_EMERGENCY_UNWIND_OK"}
+                            if reason_code_res in _unwind_failed_codes:
+                                open_leg = "YES" if yes_fs > 0 else "NO"
+                                open_shares = yes_fs if yes_fs > 0 else no_fs
+                                final_status = "PARTIAL_OPEN"
+                                # Secondary ops alert as backup channel in case executions webhook is down.
+                                asyncio.create_task(
+                                    discord.send_ops(
+                                        f"URGENT {reason_code_res} — jambe {open_leg} {open_shares:.4f} shares "
+                                        f"ouverte sur marché {str(opp.market_id)[:16]} | run={run_id} | "
+                                        f"Unwind échoué — intervention manuelle requise!"
+                                    ),
+                                    name=f"exec-unwind-failed-ops-{opp.market_id}",
+                                )
+                            elif reason_code_res in _unwind_ok_codes:
+                                final_status = "UNWIND_OK"
 
                             if final_status == "FILLED":
                                 extra = [
@@ -1277,8 +1301,41 @@ async def main() -> None:
                                         "inline": True,
                                     },
                                 ]
+                            elif final_status == "UNWIND_OK":
+                                # One leg was filled; the other FAK retry failed; emergency sell succeeded.
+                                # Show which leg was unwound and an estimated loss.
+                                unwound_leg = "YES" if yes_fs > 0 else "NO"
+                                unwound_shares = yes_fs if yes_fs > 0 else no_fs
+                                unwound_buy_price = yes_limit_est if yes_fs > 0 else no_limit_est
+                                cost_unwound_leg = unwound_shares * unwound_buy_price
+                                extra = [
+                                    {
+                                        "name": "Unwind Details",
+                                        "value": (
+                                            f"Leg unwound: **{unwound_leg}**\n"
+                                            f"Shares sold: **{unwound_shares:.4f}**\n"
+                                            f"Buy price was: ${unwound_buy_price:.4f}\n"
+                                            f"Estimated cost (leg): **${cost_unwound_leg:.4f}**\n"
+                                            f"Sell at market (FAK floor 0.001) — loss realized"
+                                        ),
+                                        "inline": True,
+                                    },
+                                    {
+                                        "name": "Code",
+                                        "value": f"`{reason_code_res}`",
+                                        "inline": True,
+                                    },
+                                    {
+                                        "name": "Latency",
+                                        "value": "\n".join(filter(None, [
+                                            f"Detect→submit: {detect_to_send_ms:.1f}ms" if detect_to_send_ms is not None else None,
+                                            f"Exec call:     {call_ms:.1f}ms",
+                                        ])) or "n/a",
+                                        "inline": True,
+                                    },
+                                ]
                             else:
-                                # CANCELLED / FAILED — show reason + what filled
+                                # CANCELLED / FAILED / PARTIAL_OPEN — show reason + what filled
                                 filled_line = ""
                                 if yes_fs > 0 or no_fs > 0:
                                     filled_line = f"\nYES filled: {yes_fs:.0f} | NO filled: {no_fs:.0f}"
