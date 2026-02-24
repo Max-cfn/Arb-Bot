@@ -188,8 +188,28 @@ impl FastExecutor {
         // -----------------------------------------------------------------
         let yes_meta = meta_cache.get(&opp.yes_token_id);
         let no_meta = meta_cache.get(&opp.no_token_id);
-        let yes_neg_risk = yes_meta.as_ref().map(|m| m.neg_risk).unwrap_or(false);
-        let no_neg_risk = no_meta.as_ref().map(|m| m.neg_risk).unwrap_or(false);
+        let yes_neg_risk = match yes_meta.as_ref() {
+            Some(m) => m.neg_risk,
+            None => {
+                warn!(
+                    "run={} yes_token={} absent from MetaCache — neg_risk defaults false \
+                     (may cause invalid signature on NegRisk markets)",
+                    run_id, opp.yes_token_id
+                );
+                false
+            }
+        };
+        let no_neg_risk = match no_meta.as_ref() {
+            Some(m) => m.neg_risk,
+            None => {
+                warn!(
+                    "run={} no_token={} absent from MetaCache — neg_risk defaults false \
+                     (may cause invalid signature on NegRisk markets)",
+                    run_id, opp.no_token_id
+                );
+                false
+            }
+        };
         let yes_tick = yes_meta
             .as_ref()
             .map(|m| m.tick_size.as_str())

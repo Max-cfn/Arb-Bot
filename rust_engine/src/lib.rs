@@ -123,11 +123,35 @@ impl HotPathEngine {
                 .expect("Failed to build tokio runtime");
 
             rt.block_on(async move {
-                // Warm metadata cache
+                // Warm metadata cache (force=false: skip already-cached tokens)
                 let all_assets = ob_manager.get_all_asset_ids();
                 if !all_assets.is_empty() {
                     info!("lib: warming MetaCache for {} assets", all_assets.len());
-                    meta_cache.warm(&all_assets).await;
+                    meta_cache.warm(&all_assets, false).await;
+                }
+
+                // Periodic MetaCache re-warm every 30 min (force=true) to correct any
+                // neg_risk values that were cached as false due to transient fetch failures
+                // at startup.  A wrong neg_risk causes the EIP-712 signature to use the
+                // wrong exchange contract address → CLOB rejects with "invalid signature".
+                {
+                    let mc_rewarm = Arc::clone(&meta_cache);
+                    let obm_rewarm = Arc::clone(&ob_manager);
+                    tokio::spawn(async move {
+                        let mut tick = interval(Duration::from_secs(1800)); // 30 min
+                        tick.tick().await; // skip the immediate first tick
+                        loop {
+                            tick.tick().await;
+                            let assets = obm_rewarm.get_all_asset_ids();
+                            if !assets.is_empty() {
+                                info!(
+                                    "lib: periodic MetaCache re-warm for {} assets",
+                                    assets.len()
+                                );
+                                mc_rewarm.warm(&assets, true).await;
+                            }
+                        }
+                    });
                 }
 
                 // Build executor (if credentials present)

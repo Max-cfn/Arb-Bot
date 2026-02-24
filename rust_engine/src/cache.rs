@@ -4,7 +4,8 @@
 use dashmap::DashMap;
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::info;
+use tokio::time::{Duration, sleep};
+use tracing::{info, warn};
 
 use crate::types::TokenMeta;
 
@@ -55,11 +56,13 @@ impl MetaCache {
     }
 
     /// Pre-warm cache for a list of token IDs (batch, parallel).
-    pub async fn warm(&self, token_ids: &[String]) {
+    /// If `force` is true, re-fetches even tokens already in the cache
+    /// (used for periodic refresh to correct stale neg_risk values).
+    pub async fn warm(&self, token_ids: &[String], force: bool) {
         let mut tasks = Vec::new();
 
         for tid in token_ids {
-            if self.cache.contains_key(tid) {
+            if !force && self.cache.contains_key(tid) {
                 continue;
             }
             let tid = tid.clone();
@@ -68,8 +71,17 @@ impl MetaCache {
 
             tasks.push(tokio::spawn(async move {
                 let tick = fetch_tick_size(&http, &base, &tid).await;
-                let neg = fetch_neg_risk(&http, &base, &tid).await;
+                let neg = fetch_neg_risk_with_retry(&http, &base, &tid).await;
                 let fee = fetch_fee_rate(&http, &base, &tid).await;
+
+                if neg.is_none() {
+                    warn!(
+                        "MetaCache: neg_risk fetch failed for token {}, defaulting to false \
+                         — EIP-712 will use regular exchange address",
+                        tid
+                    );
+                }
+
                 (
                     tid.clone(),
                     TokenMeta {
@@ -89,7 +101,9 @@ impl MetaCache {
                 warmed += 1;
             }
         }
-        info!("MetaCache: warmed {} tokens", warmed);
+        if warmed > 0 {
+            info!("MetaCache: warmed/refreshed {} tokens (force={})", warmed, force);
+        }
     }
 }
 
@@ -103,14 +117,28 @@ async fn fetch_tick_size(http: &Client, base: &str, token_id: &str) -> Option<St
     Some(data.minimum_tick_size)
 }
 
-async fn fetch_neg_risk(http: &Client, base: &str, token_id: &str) -> Option<bool> {
+/// Fetch neg_risk with up to 3 retries (200ms, 400ms backoff).
+/// neg_risk=true means the token belongs to a categorical (NegRisk) market and
+/// requires the NEG_RISK_EXCHANGE_ADDRESS in the EIP-712 domain.  A wrong value
+/// here causes an "invalid signature" rejection from the CLOB.
+async fn fetch_neg_risk_with_retry(http: &Client, base: &str, token_id: &str) -> Option<bool> {
     let url = format!("{}/neg-risk?token_id={}", base, token_id);
-    let resp = http.get(&url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
+    for attempt in 0u32..3 {
+        if attempt > 0 {
+            sleep(Duration::from_millis(200 * (1 << attempt))).await;
+        }
+        let resp = match http.get(&url).send().await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        if let Ok(data) = resp.json::<NegRiskResp>().await {
+            return Some(data.neg_risk);
+        }
     }
-    let data: NegRiskResp = resp.json().await.ok()?;
-    Some(data.neg_risk)
+    None
 }
 
 async fn fetch_fee_rate(http: &Client, base: &str, token_id: &str) -> Option<u32> {
