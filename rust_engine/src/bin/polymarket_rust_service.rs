@@ -256,13 +256,32 @@ async fn main() -> Result<()> {
 
     let assets = obm.get_all_asset_ids();
     let meta_cache = Arc::new(MetaCache::new(&cfg.clob_base_url));
-    meta_cache.warm(&assets).await;
+    meta_cache.warm(&assets, false).await;
 
     let executor = if execution_mode == "real" && !cfg.private_key.is_empty() {
         Some(Arc::new(FastExecutor::new(&cfg)?))
     } else {
         None
     };
+
+    // Periodic MetaCache re-warm every 30 min (force=true) to correct neg_risk
+    // values that may have been cached as false due to transient fetch failures.
+    {
+        let mc_rewarm = Arc::clone(&meta_cache);
+        let obm_rewarm = Arc::clone(&obm);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1800));
+            tick.tick().await; // skip first immediate tick
+            loop {
+                tick.tick().await;
+                let all = obm_rewarm.get_all_asset_ids();
+                if !all.is_empty() {
+                    info!("rust-service: periodic MetaCache re-warm for {} assets", all.len());
+                    mc_rewarm.warm(&all, true).await;
+                }
+            }
+        });
+    }
 
     // Spawn a background task that refreshes the USDC balance every 10 s.
     // The executor reads the cached value as a free atomic load in the hot path —
