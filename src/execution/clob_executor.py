@@ -850,7 +850,7 @@ class PolymarketClobExecutor:
                         opp,
                         note=f"CRITICAL: {unk_reason}",
                         run_id=run_id,
-                        status="FAILED",
+                        status="PARTIAL_OPEN",
                     ))
 
                 res = ExecutionResult(

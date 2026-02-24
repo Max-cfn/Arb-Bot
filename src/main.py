@@ -302,8 +302,10 @@ async def run_rust_hotpath(
             # For unwind failures the Rust executor returns status=CANCELLED but the position
             # may still be open (one leg filled, unwind failed).  Override the Discord status
             # to PARTIAL_OPEN so the embed gets an @here ping and routes to the error channel.
+            # For unwind successes, override to UNWIND_OK so the orange embed is shown.
             discord_status = status
             unwind_failed_codes = {"FOK_EMERGENCY_UNWIND_FAILED", "FOK_DEFENSIVE_UNWIND_FAILED"}
+            unwind_ok_codes = {"FOK_EMERGENCY_UNWIND_OK"}
             if reason_code in unwind_failed_codes:
                 open_leg = "YES" if yes_filled_size > 0 else "NO"
                 open_shares = yes_filled_size if yes_filled_size > 0 else no_filled_size
@@ -325,6 +327,15 @@ async def run_rust_hotpath(
                     ),
                     loop,
                 )
+            elif reason_code in unwind_ok_codes:
+                unwound_leg = "YES" if yes_filled_size > 0 else "NO"
+                unwound_shares = yes_filled_size if yes_filled_size > 0 else no_filled_size
+                unwind_prefix = (
+                    f"Position fermée (unwind réussi) — jambe {unwound_leg} "
+                    f"{unwound_shares:.4f} shares vendue au marché (FAK floor 0.001). Perte réalisée.\n\n"
+                )
+                note = unwind_prefix + note
+                discord_status = "UNWIND_OK"
 
             asyncio.run_coroutine_threadsafe(
                 discord.send_execution(

@@ -206,6 +206,7 @@ class DiscordClient:
             "FILLED", "SUCCESS", "COMPLETED",
             "CANCELLED", "FAILED", "REJECTED", "ERROR",
             "PARTIAL_OPEN",  # critical: cancel not confirmed by CLOB
+            "UNWIND_OK",     # position closed at a loss — surface immediately
         }
 
         # PARTIAL_OPEN is treated as an error — routes to the errors/executions channel.
