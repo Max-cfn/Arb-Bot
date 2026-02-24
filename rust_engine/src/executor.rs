@@ -462,6 +462,7 @@ impl FastExecutor {
                         uw_fee_bps,
                         uw_tick,
                         config.unwind_max_loss_pct,
+                        config.unwind_min_price_floor,
                     )
                     .await;
                 let rc = if unwind_ok {
@@ -585,6 +586,7 @@ impl FastExecutor {
                         unwind_fee_bps,
                         unwind_tick,
                         config.unwind_max_loss_pct,
+                        config.unwind_min_price_floor,
                     )
                     .await;
 
@@ -854,6 +856,7 @@ impl FastExecutor {
                     yes_fee_bps,
                     yes_tick,
                     config.unwind_max_loss_pct,
+                    config.unwind_min_price_floor,
                 )
                 .await;
             let rc = if unwind_ok {
@@ -940,6 +943,7 @@ impl FastExecutor {
                     no_fee_bps,
                     no_tick,
                     config.unwind_max_loss_pct,
+                    config.unwind_min_price_floor,
                 )
                 .await;
             let rc = if unwind_ok {
@@ -1055,12 +1059,15 @@ impl FastExecutor {
 
     /// Sell shares to unwind a one-sided position using FAK.
     ///
-    /// Two-attempt strategy:
-    ///   Attempt 1 — floor = buy_price × (1 − max_loss_pct/100), poll 600 ms.
-    ///               Fills at the best available bid as long as it's above floor.
-    ///   Attempt 2 — floor = $0.02 ("nuke price"), poll 600 ms.
-    ///               Virtually guaranteed to fill regardless of market move.
-    ///               Accepts large loss to guarantee position closure.
+    /// Three-attempt strategy with decreasing floor — never goes below `min_price_floor`:
+    ///   Attempt 1 — floor = max(buy_price × (1 − max_loss_pct/100),   min_price_floor), poll 600 ms.
+    ///   Attempt 2 — floor = max(buy_price × (1 − (max_loss_pct+2)/100), min_price_floor), poll 600 ms.
+    ///               200 ms pause before this attempt.
+    ///   Attempt 3 — floor = max(buy_price × (1 − (max_loss_pct+5)/100), min_price_floor), poll 600 ms.
+    ///               500 ms pause before this attempt.
+    ///
+    /// Each attempt fills at the best available bid as long as it's above the floor.
+    /// If all three fail the position remains open and the caller reports UNWIND_FAILED.
     ///
     /// Returns true only when a fill is confirmed (filled_size > 0 in terminal state).
     async fn unwind_sell(
@@ -1072,13 +1079,14 @@ impl FastExecutor {
         fee_rate_bps: u32,
         tick_size: &str,
         max_loss_pct: f64,
+        min_price_floor: f64,
     ) -> bool {
         if shares <= 0.0 {
             return false;
         }
 
-        // Attempt 1: sell at conservative floor (buy_price × (1 − max_loss_pct%))
-        let floor1 = (buy_price * (1.0 - max_loss_pct / 100.0)).max(0.01);
+        // Attempt 1: conservative floor (configured max loss %)
+        let floor1 = (buy_price * (1.0 - max_loss_pct / 100.0)).max(min_price_floor);
         if self
             .try_unwind_once(token_id, shares, floor1, neg_risk, fee_rate_bps, tick_size)
             .await
@@ -1086,17 +1094,36 @@ impl FastExecutor {
             return true;
         }
 
-        // Attempt 2: nuke price — accept any fill, guaranteed exit
+        // Attempt 2: widen floor by +2 percentage points, pause 200 ms first
+        sleep(Duration::from_millis(200)).await;
+        let floor2 = (buy_price * (1.0 - (max_loss_pct + 2.0) / 100.0)).max(min_price_floor);
         error!(
-            "unwind attempt 1 failed (floor={:.4}), retrying at nuke price (floor=0.02) token={}",
-            floor1, token_id
+            "unwind attempt 1 failed (floor={:.4}), retrying with wider floor={:.4} token={}",
+            floor1, floor2, token_id
         );
-        self.try_unwind_once(token_id, shares, 0.02, neg_risk, fee_rate_bps, tick_size)
+        if self
+            .try_unwind_once(token_id, shares, floor2, neg_risk, fee_rate_bps, tick_size)
+            .await
+        {
+            return true;
+        }
+
+        // Attempt 3: widen floor by +5 percentage points, pause 500 ms first
+        sleep(Duration::from_millis(500)).await;
+        let floor3 = (buy_price * (1.0 - (max_loss_pct + 5.0) / 100.0)).max(min_price_floor);
+        error!(
+            "unwind attempt 2 failed (floor={:.4}), final attempt floor={:.4} token={}",
+            floor2, floor3, token_id
+        );
+        self.try_unwind_once(token_id, shares, floor3, neg_risk, fee_rate_bps, tick_size)
             .await
     }
 
     /// Submit one FAK sell and poll up to 600 ms for a confirmed fill.
     /// Returns true only if filled_size > 0 in a terminal state.
+    ///
+    /// Retries sign+POST up to 3 times (100 ms / 200 ms backoff) to handle
+    /// transient network errors or temporary exchange availability issues.
     async fn try_unwind_once(
         &self,
         token_id: &str,
@@ -1107,32 +1134,45 @@ impl FastExecutor {
         tick_size: &str,
     ) -> bool {
         let sell_price = round_to_tick(floor_price, tick_size);
-        let order = self.build_order(token_id, sell_price, shares, fee_rate_bps, SELL);
-        let sig = match self.sign_order(&order, neg_risk) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("unwind sign failed: {}", e);
-                return false;
+
+        // Retry sign+POST up to 3 times with backoff (handles transient errors).
+        let mut oid: Option<String> = None;
+        for post_attempt in 0..3u8 {
+            if post_attempt > 0 {
+                sleep(Duration::from_millis(100 * post_attempt as u64)).await;
             }
-        };
-        let body = self.build_post_body(&order, &sig, "FAK");
-        let oid = match self.post_order(&body).await {
-            Ok(v) => {
-                let id = extract_order_id(&v);
-                info!(
-                    "unwind sell submitted: oid={:?} floor={:.4} shares={:.4}",
-                    id, floor_price, shares
-                );
-                match id {
-                    Some(s) => s,
-                    None => {
-                        error!("unwind sell: no orderID in response");
-                        return false;
+            let order = self.build_order(token_id, sell_price, shares, fee_rate_bps, SELL);
+            let sig = match self.sign_order(&order, neg_risk) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("unwind sign failed attempt={}: {}", post_attempt + 1, e);
+                    return false; // sign failure is structural, not transient
+                }
+            };
+            let body = self.build_post_body(&order, &sig, "FAK");
+            match self.post_order(&body).await {
+                Ok(v) => {
+                    let id = extract_order_id(&v);
+                    info!(
+                        "unwind sell submitted: oid={:?} floor={:.4} shares={:.4} post_attempt={}",
+                        id, floor_price, shares, post_attempt + 1,
+                    );
+                    if let Some(s) = id {
+                        oid = Some(s);
+                        break;
                     }
+                    error!("unwind sell: no orderID in response attempt={}", post_attempt + 1);
+                }
+                Err(e) => {
+                    error!("unwind sell POST failed attempt={}: {}", post_attempt + 1, e);
                 }
             }
-            Err(e) => {
-                error!("unwind sell POST failed: {}", e);
+        }
+
+        let oid = match oid {
+            Some(s) => s,
+            None => {
+                error!("unwind sell: all POST attempts failed floor={:.4} token={}", floor_price, token_id);
                 return false;
             }
         };

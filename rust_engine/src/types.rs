@@ -201,6 +201,11 @@ pub struct EngineConfig {
     pub retry_slippage_pct: f64,
     #[pyo3(get, set)]
     pub unwind_max_loss_pct: f64,
+    /// Minimum sell price floor for all unwind attempts.
+    /// The bot will never submit a sell order below this price, regardless of how many
+    /// retries have been attempted. Default: 0.10 ($0.10 per share).
+    #[pyo3(get, set)]
+    pub unwind_min_price_floor: f64,
     #[pyo3(get, set)]
     pub exec_cooldown_ms: u64,
 }
@@ -239,6 +244,7 @@ impl EngineConfig {
             retry_duration_ms: 200,
             retry_slippage_pct: 1.5,
             unwind_max_loss_pct: 3.0,
+            unwind_min_price_floor: 0.10,
             exec_cooldown_ms: 15_000,
         }
     }

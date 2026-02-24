@@ -19,6 +19,8 @@ EMBED_COLORS = {
     "execution_fill": 0x2ECC71,# Green (Filled)
     "execution_fail": 0xE74C3C,# Red (Failed)
     "execution_payout": 0x9B59B6, # Purple (Payout)
+    "unwind_ok": 0xFF8C00,     # Dark Orange (Unwind succeeded — position closed at a loss)
+    "unwind_failed": 0xFF0000, # Red (Unwind failed — position may still be open)
 }
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
@@ -294,6 +296,10 @@ def format_execution_embed(
         color = EMBED_COLORS["execution_fail"]
         title_prefix = "CRITICAL: Partial Open"
         content_ping = "@here "      # always ping — cancel not confirmed by CLOB
+    elif s_upper == "UNWIND_OK":
+        color = EMBED_COLORS["unwind_ok"]
+        title_prefix = "Unwind / Position Closed"
+        content_ping = ""            # recoverable — position closed at a loss, no manual action needed
     elif s_upper in ("FAILED", "CANCELLED", "REJECTED", "ERROR"):
         color = EMBED_COLORS["execution_fail"]
         title_prefix = "Failed / Cancelled"
@@ -367,6 +373,12 @@ def format_execution_embed(
             fields.append({
                 "name": "Reason",
                 "value": (note[:1000] if note else "Unknown error."),
+                "inline": False,
+            })
+        elif s_upper == "UNWIND_OK":
+            fields.append({
+                "name": "Unwind",
+                "value": (note[:1000] if note else "Position sold at market. Loss realized."),
                 "inline": False,
             })
         elif s_upper == "PAYOUT":

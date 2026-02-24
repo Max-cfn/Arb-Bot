@@ -850,7 +850,7 @@ class PolymarketClobExecutor:
                         opp,
                         note=f"CRITICAL: {unk_reason}",
                         run_id=run_id,
-                        status="FAILED",
+                        status="PARTIAL_OPEN",
                     ))
 
                 res = ExecutionResult(
@@ -919,12 +919,41 @@ class PolymarketClobExecutor:
 
             # Case A: both legs filled >0 (hedged, possibly smaller)
             if yes_size_filled > 0 and no_size_filled > 0:
-                # If mismatch, unwind the excess (best-effort)
+                # If mismatch, unwind the excess (best-effort bounded-loss sell)
+                excess_unwind_note = ""
                 if abs(yes_size_filled - no_size_filled) > 1e-6:
+                    excess = abs(yes_size_filled - no_size_filled)
                     if yes_size_filled > no_size_filled:
-                        await _unwind_sell(str(opp.yes_token_id), yes_size_filled - no_size_filled, yes_limit)
+                        uw_ok, uw_info = await _unwind_sell(str(opp.yes_token_id), excess, yes_limit)
+                        excess_leg = "YES"
                     else:
-                        await _unwind_sell(str(opp.no_token_id), no_size_filled - yes_size_filled, no_limit)
+                        uw_ok, uw_info = await _unwind_sell(str(opp.no_token_id), excess, no_limit)
+                        excess_leg = "NO"
+                    self._log_exec(
+                        "excess_unwind",
+                        run_id=run_id,
+                        ok=uw_ok,
+                        info=uw_info,
+                        excess_leg=excess_leg,
+                        excess_shares=round(excess, 6),
+                    )
+                    excess_unwind_note = (
+                        f" | excess_unwind leg={excess_leg} shares={excess:.4f} ok={uw_ok}"
+                    )
+                    # If the bounded unwind failed, alert immediately so the operator can
+                    # check whether there is an uncovered position.
+                    if not uw_ok and discord_alert_fn is not None:
+                        asyncio.create_task(discord_alert_fn(
+                            opp,
+                            note=(
+                                f"WARN: RECOVERY_BOTH_FILLED size mismatch — excess unwind FAILED. "
+                                f"leg={excess_leg} excess={excess:.4f} shares. "
+                                f"Both legs ARE filled; position is hedged but sizes differ. "
+                                f"Manual review recommended. err={uw_info.get('err', '')}"
+                            ),
+                            run_id=run_id,
+                            status="PARTIAL_OPEN",
+                        ))
 
                 metrics.t_both_filled_ns = time.monotonic_ns()
                 res = ExecutionResult(
@@ -934,6 +963,7 @@ class PolymarketClobExecutor:
                     no_order_id=str(no_oid) if no_oid else None,
                     reason=(
                         f"Recovery success (both legs filled>0). yes={yes_size_filled:.4f} no={no_size_filled:.4f} cancelled_open={len(to_cancel)}"
+                        f"{excess_unwind_note}"
                     ),
                     reason_code="RECOVERY_BOTH_FILLED",
                     yes_filled_size=float(yes_size_filled),
