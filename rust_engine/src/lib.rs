@@ -11,7 +11,9 @@ pub mod types;
 pub mod ws_client;
 
 use std::sync::Arc;
+use std::time::Instant;
 
+use dashmap::DashMap;
 use pyo3::prelude::*;
 use pyo3::types::PyString;
 use tokio::sync::mpsc;
@@ -130,6 +132,10 @@ impl HotPathEngine {
                     None
                 };
 
+                // Per-market execution cooldown: prevents duplicate executions
+                // Key = market_id, Value = Instant when execution was last started
+                let exec_cooldown: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
+
                 // Set up WS event channel
                 let (event_tx, mut event_rx) = mpsc::unbounded_channel::<WsEvent>();
 
@@ -191,12 +197,39 @@ impl HotPathEngine {
                                 });
 
                                 // If executor is available and verdict is ACTIONABLE, execute
+                                // with per-market cooldown to prevent duplicate executions
                                 if opportunity.verdict == "ACTIONABLE" {
                                     if let Some(ref exec) = fast_executor {
+                                        let market_id = opportunity.market_id.clone();
+                                        let cooldown_ms = config.exec_cooldown_ms;
+
+                                        // Atomic check-and-set: skip if market is in cooldown
+                                        let should_exec = {
+                                            let now = Instant::now();
+                                            let cooldown_dur = std::time::Duration::from_millis(cooldown_ms);
+                                            match exec_cooldown.entry(market_id.clone()) {
+                                                dashmap::mapref::entry::Entry::Occupied(mut e) => {
+                                                    if e.get().elapsed() < cooldown_dur {
+                                                        false
+                                                    } else {
+                                                        e.insert(now);
+                                                        true
+                                                    }
+                                                }
+                                                dashmap::mapref::entry::Entry::Vacant(e) => {
+                                                    e.insert(now);
+                                                    true
+                                                }
+                                            }
+                                        };
+
+                                        if !should_exec {
+                                            continue;
+                                        }
+
                                         let exec = Arc::clone(exec);
                                         let cfg = config.clone();
                                         let mc = Arc::clone(&meta_cache);
-                                        // Clone the callback ref under GIL for the spawned task
                                         let cb_exec = Python::with_gil(|py| {
                                             on_execution.clone_ref(py)
                                         });

@@ -322,6 +322,7 @@ async def run_rust_hotpath(
     rcfg.retry_duration_ms = int(os.getenv("RETRY_DURATION_MS", "200"))
     rcfg.retry_slippage_pct = float(os.getenv("RETRY_SLIPPAGE_PERCENT", "1.5"))
     rcfg.unwind_max_loss_pct = float(os.getenv("UNWIND_MAX_LOSS_PERCENT", "3.0"))
+    rcfg.exec_cooldown_ms = int(os.getenv("EXEC_COOLDOWN_MS", "15000"))
 
     engine = HotPathEngine(rcfg, on_opportunity, on_execution, on_ws_event)
     loaded = engine.load_markets(json.dumps(markets))
